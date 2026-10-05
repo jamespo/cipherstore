@@ -1,0 +1,105 @@
+#  cipherstore daemon, as a systemd user service.
+#
+#  Install:
+#      install -Dm644 contrib/cipherstore.service \
+#          ~/.config/systemd/user/cipherstore.service
+#      systemctl --user daemon-reload
+#      systemctl --user enable --now cipherstore
+#
+#  Then unlock it once per login:
+#      cipherstore unlock 8h
+#
+#  Logs:
+#      journalctl --user -u cipherstore -f
+#
+#  The daemon always starts locked, so enabling this unit never leaves secrets
+#  readable after a reboot -- and a restart drops the key, so the store comes
+#  back locked and must be unlocked again. That is intended.
+#
+#  Adjust ExecStart if cipherstore is installed somewhere else.
+
+[Unit]
+Description=cipherstore encrypted secret store
+Documentation=https://github.com/jamespo/cipherstore
+# The store lives under $HOME, so do not start before it is available.
+After=default.target
+
+[Service]
+Type=simple
+# Run in the foreground: systemd supervises the process directly, so the daemon
+# must not fork. Do not add -d here.
+ExecStart=%h/.local/bin/cipherstore start
+
+# No ExecStop: the daemon handles SIGTERM, closing the database and removing
+# both sockets. Running `cipherstore stop` here would fail noisily whenever the
+# daemon had already exited.
+
+Restart=on-failure
+RestartSec=2
+
+#  Hardening.
+#
+#  mlockall() is what would keep the database key and decrypted pages out of
+#  swap, and it needs a memlock allowance to succeed.
+#
+#  Be aware that this line mostly does not work in a *user* unit: raising a
+#  hard limit needs CAP_SYS_RESOURCE, which an unprivileged user manager does
+#  not have, so the value is silently clamped to DefaultLimitMEMLOCK (commonly
+#  8 MiB). The daemon's mlockall() then fails with ENOMEM, it logs a notice,
+#  and it carries on without the protection.
+#
+#  To actually get it, raise the limit system-wide -- e.g. a drop-in setting
+#  DefaultLimitMEMLOCK= under /etc/systemd/user.conf.d/ -- or, more simply,
+#  use an encrypted swap device or no swap at all.
+LimitMEMLOCK=infinity
+
+# A core dump would contain the passphrase and every decrypted secret. The
+# daemon also sets RLIMIT_CORE itself; this is belt and braces.
+LimitCORE=0
+
+# Keep $HOME writable: on first run the daemon creates
+# ~/.local/state/cipherstore and ~/.local/share/sqlcipher itself, with the
+# ownership and 0700 modes it then verifies on every use. ProtectSystem=full
+# still makes /usr, /boot and /etc read-only.
+#
+# For tighter confinement, swap the line below for:
+#     ProtectSystem=strict
+#     ProtectHome=read-only
+#     ReadWritePaths=%h/.local/state/cipherstore %h/.local/share/sqlcipher
+# but create both directories first -- systemd refuses to start a unit whose
+# ReadWritePaths do not exist, and under that policy the daemon cannot create
+# them itself.
+ProtectSystem=full
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Local UNIX sockets only; cipherstore never talks to the network.
+# (IPAddressDeny= is deliberately omitted: it is ignored in user units and only
+# produces a "configures an IP firewall, but not running as root" warning.
+# PrivateNetwork plus RestrictAddressFamilies already covers this.)
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=yes
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Keep new files at the modes cipherstore expects. It sets them explicitly and
+# verifies them itself, but this stops a permissive umask from racing it.
+UMask=0077
+
+[Install]
+WantedBy=default.target
