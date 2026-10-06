@@ -47,7 +47,7 @@ func Default() (Layout, error) {
 	}
 
 	stateDir := filepath.Join(stateHome, "cipherstore")
-	dataDir := filepath.Join(dataHome, "sqlcipher")
+	dataDir := filepath.Join(dataHome, "cipherstore")
 
 	return Layout{
 		StateDir:      stateDir,
@@ -55,7 +55,7 @@ func Default() (Layout, error) {
 		AuthedSocket:  filepath.Join(stateDir, "authed"),
 		LockFile:      filepath.Join(stateDir, "daemon.lock"),
 		DataDir:       dataDir,
-		DBPath:        filepath.Join(dataDir, "sqlcipher.sqlite"),
+		DBPath:        filepath.Join(dataDir, "cipherstore.sqlite"),
 	}, nil
 }
 

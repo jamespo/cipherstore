@@ -58,14 +58,14 @@ LimitMEMLOCK=infinity
 LimitCORE=0
 
 # Keep $HOME writable: on first run the daemon creates
-# ~/.local/state/cipherstore and ~/.local/share/sqlcipher itself, with the
+# ~/.local/state/cipherstore and ~/.local/share/cipherstore itself, with the
 # ownership and 0700 modes it then verifies on every use. ProtectSystem=full
 # still makes /usr, /boot and /etc read-only.
 #
 # For tighter confinement, swap the line below for:
 #     ProtectSystem=strict
 #     ProtectHome=read-only
-#     ReadWritePaths=%h/.local/state/cipherstore %h/.local/share/sqlcipher
+#     ReadWritePaths=%h/.local/state/cipherstore %h/.local/share/cipherstore
 # but create both directories first -- systemd refuses to start a unit whose
 # ReadWritePaths do not exist, and under that policy the daemon cannot create
 # them itself.

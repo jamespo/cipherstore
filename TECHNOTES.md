@@ -72,7 +72,7 @@ token. The resulting key is the passphrase itself, so the database stays
 openable with the stock `sqlcipher` CLI — useful for disaster recovery:
 
 ```console
-$ sqlcipher ~/.local/share/sqlcipher/sqlcipher.sqlite
+$ sqlcipher ~/.local/share/cipherstore/cipherstore.sqlite
 sqlite> PRAGMA key = 'your passphrase';
 sqlite> SELECT token_id, comment FROM secrets;
 ```

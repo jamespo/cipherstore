@@ -21,8 +21,8 @@ func TestDefaultHonoursXDGVariables(t *testing.T) {
 		{"ControlSocket", l.ControlSocket, "/custom/state/cipherstore/control"},
 		{"AuthedSocket", l.AuthedSocket, "/custom/state/cipherstore/authed"},
 		{"LockFile", l.LockFile, "/custom/state/cipherstore/daemon.lock"},
-		{"DataDir", l.DataDir, "/custom/data/sqlcipher"},
-		{"DBPath", l.DBPath, "/custom/data/sqlcipher/sqlcipher.sqlite"},
+		{"DataDir", l.DataDir, "/custom/data/cipherstore"},
+		{"DBPath", l.DBPath, "/custom/data/cipherstore/cipherstore.sqlite"},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
@@ -43,7 +43,7 @@ func TestDefaultFallsBackToHome(t *testing.T) {
 	if want := "/home/testuser/.local/state/cipherstore/control"; l.ControlSocket != want {
 		t.Errorf("ControlSocket = %q, want %q", l.ControlSocket, want)
 	}
-	if want := "/home/testuser/.local/share/sqlcipher/sqlcipher.sqlite"; l.DBPath != want {
+	if want := "/home/testuser/.local/share/cipherstore/cipherstore.sqlite"; l.DBPath != want {
 		t.Errorf("DBPath = %q, want %q", l.DBPath, want)
 	}
 }
@@ -66,7 +66,7 @@ func TestEnsureDirsCreateWith0700(t *testing.T) {
 	root := t.TempDir()
 	l := Layout{
 		StateDir: filepath.Join(root, "state", "cipherstore"),
-		DataDir:  filepath.Join(root, "data", "sqlcipher"),
+		DataDir:  filepath.Join(root, "data", "cipherstore"),
 	}
 
 	if err := l.EnsureStateDir(); err != nil {

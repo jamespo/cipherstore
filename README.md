@@ -169,7 +169,7 @@ foreground).
 | `~/.local/state/cipherstore/control` | 0700 | Control socket; exists while the daemon runs |
 | `~/.local/state/cipherstore/authed` | 0700 | Secret-operation socket; **exists only while unlocked** |
 | `~/.local/state/cipherstore/daemon.lock` | 0600 | `flock`ed to enforce a single daemon per user |
-| `~/.local/share/sqlcipher/sqlcipher.sqlite` | 0600 | The encrypted database |
+| `~/.local/share/cipherstore/cipherstore.sqlite` | 0600 | The encrypted database |
 
 `XDG_STATE_HOME` and `XDG_DATA_HOME` are honoured when set to absolute paths.
 
