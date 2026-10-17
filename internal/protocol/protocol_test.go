@@ -127,8 +127,19 @@ func TestRoundTripImportRequestAndResponse(t *testing.T) {
 	if err := ReadMessage(server, bufio.NewReader(server), &got); err != nil {
 		t.Fatalf("ReadMessage: %v", err)
 	}
-	if !reflect.DeepEqual(got, *want) {
-		t.Errorf("got %+v, want %+v", got, *want)
+	// Not reflect.DeepEqual: round-tripping through JSON reparses UpdatedAt
+	// into a time.Time whose internal representation can differ from the
+	// original (e.g. its *Location) despite denoting the same instant, which
+	// DeepEqual (like ==) treats as unequal. Compare fields individually and
+	// use Equal for the times.
+	if got.Op != want.Op || got.ReplaceNewer != want.ReplaceNewer || len(got.Entries) != len(want.Entries) {
+		t.Fatalf("got %+v, want %+v", got, *want)
+	}
+	for i, e := range want.Entries {
+		ge := got.Entries[i]
+		if ge.TokenID != e.TokenID || ge.Secret != e.Secret || ge.Comment != e.Comment || !ge.UpdatedAt.Equal(e.UpdatedAt) {
+			t.Errorf("entry %d = %+v, want %+v", i, ge, e)
+		}
 	}
 
 	client2, server2 := pipe(t)
