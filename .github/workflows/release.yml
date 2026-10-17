@@ -53,17 +53,23 @@ jobs:
           if-no-files-found: error
 
   # SQLCipher needs CGO, which cannot realistically be cross-compiled for
-  # Darwin from a Linux runner, so each macOS target is built natively on a
-  # runner of its own architecture instead of through GoReleaser.
+  # Darwin from a Linux runner, so macOS binaries are built on a macOS runner
+  # instead of through GoReleaser. Both architectures are built on the same
+  # (Apple Silicon) runner: Xcode's clang cross-compiles for x86_64 just as
+  # well as it compiles natively for arm64, which sidesteps needing an actual
+  # Intel runner -- GitHub retired the free one (macos-13) in December 2025,
+  # and its replacements are a paid "larger runners" tier.
   macos:
+    runs-on: macos-14
     strategy:
       matrix:
         include:
-          - runner: macos-13
-            archlabel: x86_64
-          - runner: macos-14
+          - goarch: arm64
             archlabel: arm64
-    runs-on: ${{ matrix.runner }}
+            cc: ""
+          - goarch: amd64
+            archlabel: x86_64
+            cc: "clang -arch x86_64"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -82,6 +88,10 @@ jobs:
       - name: Build
         env:
           CGO_ENABLED: "1"
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+          CGO_CFLAGS: ${{ matrix.cc != '' && '-arch x86_64' || '' }}
+          CGO_LDFLAGS: ${{ matrix.cc != '' && '-arch x86_64' || '' }}
         run: |
           go build -trimpath \
             -ldflags "-s -w -X github.com/jamespo/cipherstore/internal/cli.version=${{ steps.ver.outputs.version }}" \
