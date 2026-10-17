@@ -29,9 +29,9 @@ details and the full security analysis — live in [TECHNOTES.md](TECHNOTES.md).
 ## Install
 
 Requires Go 1.24+ and a C compiler. SQLCipher itself is vendored through
-[`mutecomm/go-sqlcipher`](https://github.com/mutecomm/go-sqlcipher), so there is
-no SQLCipher package to install — but the build does need `libcrypto` headers
-(`openssl-devel` / `libssl-dev`).
+[`mutecomm/go-sqlcipher`](https://github.com/mutecomm/go-sqlcipher), built with
+its bundled LibTomCrypt backend, so there is no SQLCipher package — nor
+OpenSSL — to install.
 
 ```sh
 go build -o cipherstore .
