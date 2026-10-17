@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testDBPath(t *testing.T) string {
@@ -345,6 +346,137 @@ func TestHostileValues(t *testing.T) {
 	}
 	if len(entries) != len(values) {
 		t.Errorf("List returned %d entries, want %d", len(entries), len(values))
+	}
+}
+
+func TestExportIncludesSecrets(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t, testDBPath(t), "pw")
+
+	for _, tok := range []string{"zebra", "alpha"} {
+		if _, err := s.Put(ctx, tok, "secret-"+tok, "c-"+tok, true); err != nil {
+			t.Fatalf("Put %q: %v", tok, err)
+		}
+	}
+
+	entries, err := s.Export(ctx)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	want := []string{"alpha", "zebra"}
+	if len(entries) != len(want) {
+		t.Fatalf("Export returned %d entries, want %d", len(entries), len(want))
+	}
+	for i, e := range entries {
+		if e.TokenID != want[i] {
+			t.Errorf("entry %d token = %q, want %q", i, e.TokenID, want[i])
+		}
+		if e.Secret != "secret-"+want[i] {
+			t.Errorf("entry %d secret = %q, want %q", i, e.Secret, "secret-"+want[i])
+		}
+	}
+}
+
+func TestImportAddsNewEntries(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t, testDBPath(t), "pw")
+
+	now := time.Now().Truncate(time.Second)
+	stats, err := s.Import(ctx, []Entry{
+		{TokenID: "a", Secret: "sa", Comment: "ca", UpdatedAt: now},
+		{TokenID: "b", Secret: "sb", UpdatedAt: now},
+	}, false)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if stats.Imported != 2 || stats.Replaced != 0 || stats.Skipped != 0 {
+		t.Errorf("stats = %+v, want 2 imported, 0 replaced, 0 skipped", stats)
+	}
+
+	got, err := s.Get(ctx, "a")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Secret != "sa" || got.Comment != "ca" {
+		t.Errorf("entry a = %+v, want secret sa / comment ca", got)
+	}
+	if !got.UpdatedAt.Equal(now) {
+		t.Errorf("UpdatedAt = %v, want the imported timestamp %v preserved", got.UpdatedAt, now)
+	}
+}
+
+// Without -replace-newer, an import must never touch an existing entry, even
+// when the imported version is newer.
+func TestImportDefaultDoesNotReplaceExisting(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t, testDBPath(t), "pw")
+
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if _, err := s.Import(ctx, []Entry{{TokenID: "tok", Secret: "original", UpdatedAt: old}}, false); err != nil {
+		t.Fatalf("seed import: %v", err)
+	}
+
+	newer := time.Now().Truncate(time.Second)
+	stats, err := s.Import(ctx, []Entry{{TokenID: "tok", Secret: "incoming", UpdatedAt: newer}}, false)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if stats.Skipped != 1 || stats.Replaced != 0 || stats.Imported != 0 {
+		t.Errorf("stats = %+v, want 1 skipped", stats)
+	}
+
+	got, err := s.Get(ctx, "tok")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Secret != "original" {
+		t.Errorf("secret = %q, want it left as %q", got.Secret, "original")
+	}
+}
+
+// With -replace-newer, an import must overwrite an existing entry only when
+// the imported version is strictly newer.
+func TestImportReplaceNewerOnlyWhenNewer(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t, testDBPath(t), "pw")
+
+	base := time.Now().Truncate(time.Second)
+	if _, err := s.Import(ctx, []Entry{{TokenID: "tok", Secret: "v1", UpdatedAt: base}}, false); err != nil {
+		t.Fatalf("seed import: %v", err)
+	}
+
+	// Same age or older: left untouched even with replaceNewer.
+	stats, err := s.Import(ctx, []Entry{{TokenID: "tok", Secret: "same-age", UpdatedAt: base}}, true)
+	if err != nil {
+		t.Fatalf("Import (same age): %v", err)
+	}
+	if stats.Skipped != 1 || stats.Replaced != 0 {
+		t.Errorf("stats = %+v, want 1 skipped for an entry of equal age", stats)
+	}
+
+	// Strictly newer: replaced.
+	newer := base.Add(time.Minute)
+	stats, err = s.Import(ctx, []Entry{{TokenID: "tok", Secret: "v2", Comment: "updated", UpdatedAt: newer}}, true)
+	if err != nil {
+		t.Fatalf("Import (newer): %v", err)
+	}
+	if stats.Replaced != 1 || stats.Skipped != 0 {
+		t.Errorf("stats = %+v, want 1 replaced", stats)
+	}
+
+	got, err := s.Get(ctx, "tok")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Secret != "v2" || got.Comment != "updated" {
+		t.Errorf("entry = %+v, want secret v2 / comment updated", got)
+	}
+}
+
+func TestImportRejectsEmptyTokenID(t *testing.T) {
+	s := openStore(t, testDBPath(t), "pw")
+	if _, err := s.Import(context.Background(), []Entry{{TokenID: "", Secret: "x"}}, false); err == nil {
+		t.Error("Import with an empty token id succeeded, want an error")
 	}
 }
 

@@ -229,6 +229,96 @@ func (s *Store) List(ctx context.Context) ([]Entry, error) {
 	return out, nil
 }
 
+// ImportStats summarises what an Import call did.
+type ImportStats struct {
+	// Imported counts entries that did not already exist.
+	Imported int
+	// Replaced counts existing entries overwritten because the imported
+	// version was newer and replaceNewer was requested.
+	Replaced int
+	// Skipped counts existing entries left untouched.
+	Skipped int
+}
+
+// Export returns every entry, including secrets, ordered by token ID.
+func (s *Store) Export(ctx context.Context) ([]Entry, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT token_id, secret, comment, updated_at FROM secrets ORDER BY token_id`)
+	if err != nil {
+		return nil, fmt.Errorf("export: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Entry
+	for rows.Next() {
+		var (
+			e     Entry
+			unix_ int64
+		)
+		if err := rows.Scan(&e.TokenID, &e.Secret, &e.Comment, &unix_); err != nil {
+			return nil, fmt.Errorf("export: %w", err)
+		}
+		e.UpdatedAt = time.Unix(unix_, 0)
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("export: %w", err)
+	}
+	return out, nil
+}
+
+// Import adds entries to the store. An entry whose token ID does not already
+// exist is always added. An entry that collides with an existing token is
+// left untouched unless replaceNewer is true and the imported entry's
+// UpdatedAt is strictly after the existing one's, in which case it replaces
+// it (secret, comment and UpdatedAt all taken from the import). The imported
+// UpdatedAt is preserved rather than reset to now, so a re-import stays
+// comparable.
+func (s *Store) Import(ctx context.Context, entries []Entry, replaceNewer bool) (ImportStats, error) {
+	var stats ImportStats
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return stats, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, e := range entries {
+		if e.TokenID == "" {
+			return stats, errors.New("import entry has an empty token id")
+		}
+
+		var existingUnix int64
+		err := tx.QueryRowContext(ctx, `SELECT updated_at FROM secrets WHERE token_id = ?`, e.TokenID).Scan(&existingUnix)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO secrets (token_id, secret, comment, updated_at) VALUES (?, ?, ?, ?)`,
+				e.TokenID, e.Secret, e.Comment, e.UpdatedAt.Unix(),
+			); err != nil {
+				return stats, fmt.Errorf("import %q: %w", e.TokenID, err)
+			}
+			stats.Imported++
+		case err != nil:
+			return stats, fmt.Errorf("import %q: %w", e.TokenID, err)
+		case replaceNewer && e.UpdatedAt.Unix() > existingUnix:
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE secrets SET secret = ?, comment = ?, updated_at = ? WHERE token_id = ?`,
+				e.Secret, e.Comment, e.UpdatedAt.Unix(), e.TokenID,
+			); err != nil {
+				return stats, fmt.Errorf("import %q: %w", e.TokenID, err)
+			}
+			stats.Replaced++
+		default:
+			stats.Skipped++
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return stats, fmt.Errorf("commit: %w", err)
+	}
+	return stats, nil
+}
+
 // connector opens keyed connections to the database.
 type connector struct {
 	dsn string

@@ -7,6 +7,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -80,6 +82,10 @@ func Run(args []string) int {
 		cmdErr = e.cmdDelete(rest)
 	case "list":
 		cmdErr = e.cmdList(rest)
+	case "export":
+		cmdErr = e.cmdExport(rest)
+	case "import":
+		cmdErr = e.cmdImport(rest)
 	case "version", "--version", "-v":
 		fmt.Fprintf(e.stdout, "cipherstore %s\n", version)
 		return exitOK
@@ -477,6 +483,101 @@ func (e *env) cmdList(args []string) error {
 	return tw.Flush()
 }
 
+// cmdExport writes every entry, including secrets, to a JSON flat file.
+func (e *env) cmdExport(args []string) error {
+	fs := newFlagSet("export")
+	if err := fs.Parse(args); err != nil {
+		return errUsage
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("%w: export <file>", errUsage)
+	}
+	path := fs.Arg(0)
+
+	resp, err := e.sendAuthed(&protocol.Request{Op: protocol.OpExport})
+	if err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(resp.Entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode export: %w", err)
+	}
+	data = append(data, '\n')
+
+	if err := writeOwnerOnlyFile(path, data); err != nil {
+		return err
+	}
+	fmt.Fprintf(e.stdout, "exported %d entries to %s\n", len(resp.Entries), path)
+	return nil
+}
+
+// cmdImport reads entries from a JSON flat file (as produced by `export`) and
+// adds them to the store. An entry colliding with an existing token is left
+// untouched unless -replace-newer is given and the imported entry is newer.
+func (e *env) cmdImport(args []string) error {
+	fs := newFlagSet("import")
+	replaceNewer := fs.Bool("replace-newer", false, "replace an existing entry when the imported entry is newer (by updated_at)")
+	if err := fs.Parse(args); err != nil {
+		return errUsage
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("%w: import [-replace-newer] <file>", errUsage)
+	}
+	path := fs.Arg(0)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var entries []protocol.Entry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	for i, en := range entries {
+		if en.TokenID == "" {
+			return fmt.Errorf("%s: entry %d has an empty token id", path, i)
+		}
+	}
+
+	resp, err := e.sendAuthed(&protocol.Request{
+		Op:           protocol.OpImport,
+		Entries:      entries,
+		ReplaceNewer: *replaceNewer,
+	})
+	if err != nil {
+		return err
+	}
+	st := resp.Import
+	if st == nil {
+		return errors.New("daemon returned no import result")
+	}
+	fmt.Fprintf(e.stdout, "imported %d, replaced %d, skipped %d\n", st.Imported, st.Replaced, st.Skipped)
+	return nil
+}
+
+// writeOwnerOnlyFile writes data to path such that only its owner can read
+// it, refusing to follow an existing symlink so a planted link cannot
+// redirect the write.
+func writeOwnerOnlyFile(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	// OpenFile's mode is only applied on creation and is masked by umask, and
+	// an existing file keeps whatever mode it already had; chmod explicitly so
+	// the file is 0600 either way.
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return fmt.Errorf("chmod %s: %w", path, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return f.Close()
+}
+
 // newFlagSet builds a flag set that reports errors through our own messages
 // rather than printing its own usage block.
 func newFlagSet(name string) *flag.FlagSet {
@@ -542,6 +643,13 @@ Secrets (require an unlocked store):
                              Read the secret from standard input
   delete <tokenid>           Remove a token
   list                       List token ids, comments and update times
+  export <file>              Write every entry, including secrets, to a JSON
+                             file readable only by its owner
+  import [-replace-newer] <file>
+                             Add entries from a JSON file (as produced by
+                             export); an entry colliding with an existing
+                             token is left untouched unless -replace-newer is
+                             given and the imported entry is newer
 
 Other:
   version                    Print the version

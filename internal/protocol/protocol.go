@@ -34,6 +34,8 @@ const (
 	OpAdd    Op = "add"
 	OpDelete Op = "delete"
 	OpList   Op = "list"
+	OpExport Op = "export"
+	OpImport Op = "import"
 )
 
 // MaxMessageBytes caps a single request or response. Secrets are expected to
@@ -65,13 +67,31 @@ type Request struct {
 	// explicitly set to the empty string" on OpAdd. When false, an update
 	// leaves any existing comment untouched.
 	SetComment bool `json:"set_comment,omitempty"`
+
+	// Entries carries the entries to write on OpImport.
+	Entries []Entry `json:"entries,omitempty"`
+
+	// ReplaceNewer, on OpImport, allows an imported entry to overwrite an
+	// existing one when the imported entry's UpdatedAt is strictly newer.
+	// When false, an existing entry is never touched by an import.
+	ReplaceNewer bool `json:"replace_newer,omitempty"`
 }
 
-// Entry is one row of the store as returned by OpList.
+// Entry is one row of the store, as returned by OpList and OpExport. Secret
+// is populated by OpExport but left empty by OpList, and is also what a
+// client sends (filled in) on OpImport.
 type Entry struct {
 	TokenID   string    `json:"token_id"`
+	Secret    string    `json:"secret,omitempty"`
 	Comment   string    `json:"comment,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ImportStats summarises the result of OpImport.
+type ImportStats struct {
+	Imported int `json:"imported"`
+	Replaced int `json:"replaced"`
+	Skipped  int `json:"skipped"`
 }
 
 // Status reports daemon state, returned by OpStatus.
@@ -88,11 +108,12 @@ type Status struct {
 type Response struct {
 	Error string `json:"error,omitempty"`
 
-	Secret  string  `json:"secret,omitempty"`
-	Found   bool    `json:"found,omitempty"`
-	Created bool    `json:"created,omitempty"`
-	Entries []Entry `json:"entries,omitempty"`
-	Status  *Status `json:"status,omitempty"`
+	Secret  string       `json:"secret,omitempty"`
+	Found   bool         `json:"found,omitempty"`
+	Created bool         `json:"created,omitempty"`
+	Entries []Entry      `json:"entries,omitempty"`
+	Status  *Status      `json:"status,omitempty"`
+	Import  *ImportStats `json:"import,omitempty"`
 }
 
 // Err returns the response's error as a Go error, or nil if the request

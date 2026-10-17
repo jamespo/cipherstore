@@ -199,6 +199,10 @@ func (d *Daemon) handleAuthed(conn net.Conn) {
 		resp = d.doDelete(ctx, req)
 	case protocol.OpList:
 		resp = d.doList(ctx)
+	case protocol.OpExport:
+		resp = d.doExport(ctx)
+	case protocol.OpImport:
+		resp = d.doImport(ctx, req)
 	default:
 		resp = errResponse(fmt.Errorf("unknown operation %q", req.Op))
 	}
@@ -353,6 +357,45 @@ func (d *Daemon) doList(ctx context.Context) protocol.Response {
 		out = append(out, protocol.Entry{TokenID: e.TokenID, Comment: e.Comment, UpdatedAt: e.UpdatedAt})
 	}
 	return protocol.Response{Entries: out}
+}
+
+func (d *Daemon) doExport(ctx context.Context) protocol.Response {
+	st, err := d.unlockedStore()
+	if err != nil {
+		return errResponse(err)
+	}
+	entries, err := st.Export(ctx)
+	if err != nil {
+		return errResponse(err)
+	}
+	out := make([]protocol.Entry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, protocol.Entry{TokenID: e.TokenID, Secret: e.Secret, Comment: e.Comment, UpdatedAt: e.UpdatedAt})
+	}
+	return protocol.Response{Entries: out}
+}
+
+func (d *Daemon) doImport(ctx context.Context, req *protocol.Request) protocol.Response {
+	st, err := d.unlockedStore()
+	if err != nil {
+		return errResponse(err)
+	}
+	entries := make([]store.Entry, 0, len(req.Entries))
+	for _, e := range req.Entries {
+		if e.TokenID == "" {
+			return errResponse(errors.New("import entry has an empty token id"))
+		}
+		entries = append(entries, store.Entry{TokenID: e.TokenID, Secret: e.Secret, Comment: e.Comment, UpdatedAt: e.UpdatedAt})
+	}
+	stats, err := st.Import(ctx, entries, req.ReplaceNewer)
+	if err != nil {
+		return errResponse(err)
+	}
+	return protocol.Response{Import: &protocol.ImportStats{
+		Imported: stats.Imported,
+		Replaced: stats.Replaced,
+		Skipped:  stats.Skipped,
+	}}
 }
 
 // unlockedStore returns the open store, or an error if the daemon locked
@@ -526,11 +569,10 @@ func hardenProcess(logger *log.Logger) {
 	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{Cur: 0, Max: 0}); err != nil {
 		logger.Printf("warning: could not disable core dumps: %v", err)
 	}
-	// PR_SET_DUMPABLE=0 stops another process running as the same user from
-	// attaching with ptrace or reading /proc/pid/mem.
-	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
-		logger.Printf("warning: could not clear dumpable flag: %v", err)
-	}
+	// Stops another process running as the same user from attaching with
+	// ptrace or reading process memory. What this takes is platform-specific;
+	// see disableDumpable.
+	disableDumpable(logger)
 	// Keeping pages resident stops the key or decrypted rows from reaching
 	// swap. Commonly fails on RLIMIT_MEMLOCK, hence best-effort.
 	if err := unix.Mlockall(unix.MCL_CURRENT | unix.MCL_FUTURE); err != nil {

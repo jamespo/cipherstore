@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -67,8 +68,46 @@ func TestRoundTripRequest(t *testing.T) {
 	if err := ReadMessage(server, bufio.NewReader(server), &got); err != nil {
 		t.Fatalf("ReadMessage: %v", err)
 	}
-	if got != *want {
+	if !reflect.DeepEqual(got, *want) {
 		t.Errorf("got %+v, want %+v", got, *want)
+	}
+}
+
+func TestRoundTripImportRequestAndResponse(t *testing.T) {
+	client, server := pipe(t)
+
+	now := time.Now().Truncate(time.Second)
+	want := &Request{
+		Op:           OpImport,
+		ReplaceNewer: true,
+		Entries: []Entry{
+			{TokenID: "a", Secret: "sa", Comment: "ca", UpdatedAt: now},
+			{TokenID: "b", Secret: "sb", UpdatedAt: now},
+		},
+	}
+	if err := WriteMessage(client, want); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+
+	var got Request
+	if err := ReadMessage(server, bufio.NewReader(server), &got); err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if !reflect.DeepEqual(got, *want) {
+		t.Errorf("got %+v, want %+v", got, *want)
+	}
+
+	client2, server2 := pipe(t)
+	wantResp := &Response{Import: &ImportStats{Imported: 1, Replaced: 2, Skipped: 3}}
+	if err := WriteMessage(client2, wantResp); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	var gotResp Response
+	if err := ReadMessage(server2, bufio.NewReader(server2), &gotResp); err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if gotResp.Import == nil || *gotResp.Import != *wantResp.Import {
+		t.Errorf("got %+v, want %+v", gotResp.Import, wantResp.Import)
 	}
 }
 

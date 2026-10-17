@@ -48,6 +48,10 @@ func TestUsageErrorsExitTwo(t *testing.T) {
 		{"delete with no args", func(e *env) error { return e.cmdDelete(nil) }},
 		{"delete with two args", func(e *env) error { return e.cmdDelete([]string{"a", "b"}) }},
 		{"list with args", func(e *env) error { return e.cmdList([]string{"x"}) }},
+		{"export with no args", func(e *env) error { return e.cmdExport(nil) }},
+		{"export with two args", func(e *env) error { return e.cmdExport([]string{"a", "b"}) }},
+		{"import with no args", func(e *env) error { return e.cmdImport(nil) }},
+		{"import with two args", func(e *env) error { return e.cmdImport([]string{"a", "b"}) }},
 		{"status with args", func(e *env) error { return e.cmdStatus([]string{"x"}) }},
 		{"stop with args", func(e *env) error { return e.cmdStop([]string{"x"}) }},
 		{"start with args", func(e *env) error { return e.cmdStart([]string{"x"}) }},
@@ -93,6 +97,14 @@ func TestCommandsReportMissingDaemon(t *testing.T) {
 		{"stop", func(e *env) error { return e.cmdStop(nil) }},
 		{"list", func(e *env) error { return e.cmdList(nil) }},
 		{"get", func(e *env) error { return e.cmdGet([]string{"tok"}) }},
+		{"export", func(e *env) error { return e.cmdExport([]string{"out.json"}) }},
+		{"import", func(e *env) error {
+			path := filepath.Join(t.TempDir(), "in.json")
+			if err := os.WriteFile(path, []byte(`[{"token_id":"tok","secret":"sec"}]`), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			return e.cmdImport([]string{path})
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			e, _, _ := newEnv(t, "")
@@ -239,9 +251,96 @@ func TestUsageMentionsEveryCommand(t *testing.T) {
 	var buf bytes.Buffer
 	usage(&buf)
 	text := buf.String()
-	for _, cmd := range []string{"start", "stop", "unlock", "lock", "status", "get", "add", "delete", "list", "version", "help"} {
+	for _, cmd := range []string{"start", "stop", "unlock", "lock", "status", "get", "add", "delete", "list", "export", "import", "version", "help"} {
 		if !strings.Contains(text, cmd) {
 			t.Errorf("usage does not mention %q", cmd)
 		}
+	}
+}
+
+// Import reads and validates the file before ever touching the daemon, so
+// this is testable without a running one.
+func TestImportRejectsEntryWithEmptyTokenID(t *testing.T) {
+	e, _, _ := newEnv(t, "")
+	path := filepath.Join(t.TempDir(), "in.json")
+	if err := os.WriteFile(path, []byte(`[{"token_id":"","secret":"sec"}]`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := e.cmdImport([]string{path}); err == nil {
+		t.Fatal("import of an entry with an empty token id succeeded, want an error")
+	}
+}
+
+func TestImportRejectsMalformedJSON(t *testing.T) {
+	e, _, _ := newEnv(t, "")
+	path := filepath.Join(t.TempDir(), "in.json")
+	if err := os.WriteFile(path, []byte(`not json`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := e.cmdImport([]string{path}); err == nil {
+		t.Fatal("import of malformed JSON succeeded, want an error")
+	}
+}
+
+func TestImportReportsMissingFile(t *testing.T) {
+	e, _, _ := newEnv(t, "")
+	if err := e.cmdImport([]string{filepath.Join(t.TempDir(), "nope.json")}); err == nil {
+		t.Fatal("import of a missing file succeeded, want an error")
+	}
+}
+
+func TestWriteOwnerOnlyFileSetsPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.json")
+	if err := writeOwnerOnlyFile(path, []byte("data")); err != nil {
+		t.Fatalf("writeOwnerOnlyFile: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("mode = %#o, want %#o", perm, 0o600)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "data" {
+		t.Errorf("contents = %q, want %q", got, "data")
+	}
+}
+
+// A pre-existing file loosened by a stray chmod must be tightened, not left
+// as-is, since it may already contain secrets from a previous export.
+func TestWriteOwnerOnlyFileTightensLoosePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.json")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := writeOwnerOnlyFile(path, []byte("new")); err != nil {
+		t.Fatalf("writeOwnerOnlyFile: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("mode = %#o, want %#o", perm, 0o600)
+	}
+}
+
+func TestWriteOwnerOnlyFileRefusesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.json")
+	link := filepath.Join(dir, "link.json")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	if err := writeOwnerOnlyFile(link, []byte("data")); err == nil {
+		t.Fatal("writeOwnerOnlyFile on a symlink succeeded, want an error")
 	}
 }

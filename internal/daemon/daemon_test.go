@@ -376,6 +376,115 @@ func TestEmptyTokenIDRejected(t *testing.T) {
 	}
 }
 
+func TestExportIncludesSecrets(t *testing.T) {
+	h := start(t)
+	h.unlock()
+
+	if resp := h.authed(&protocol.Request{Op: protocol.OpAdd, TokenID: "tok", Secret: "sec", Comment: "c", SetComment: true}); resp.Error != "" {
+		t.Fatalf("add: %s", resp.Error)
+	}
+
+	resp := h.authed(&protocol.Request{Op: protocol.OpExport})
+	if resp.Error != "" {
+		t.Fatalf("export: %s", resp.Error)
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("export returned %d entries, want 1", len(resp.Entries))
+	}
+	if resp.Entries[0].Secret != "sec" {
+		t.Errorf("exported secret = %q, want %q", resp.Entries[0].Secret, "sec")
+	}
+	if resp.Entries[0].Comment != "c" {
+		t.Errorf("exported comment = %q, want %q", resp.Entries[0].Comment, "c")
+	}
+}
+
+func TestImportAddsEntriesAndReportsStats(t *testing.T) {
+	h := start(t)
+	h.unlock()
+
+	now := time.Now().Truncate(time.Second)
+	resp := h.authed(&protocol.Request{Op: protocol.OpImport, Entries: []protocol.Entry{
+		{TokenID: "a", Secret: "sa", UpdatedAt: now},
+		{TokenID: "b", Secret: "sb", UpdatedAt: now},
+	}})
+	if resp.Error != "" {
+		t.Fatalf("import: %s", resp.Error)
+	}
+	if resp.Import == nil || resp.Import.Imported != 2 || resp.Import.Replaced != 0 || resp.Import.Skipped != 0 {
+		t.Errorf("import stats = %+v, want 2 imported", resp.Import)
+	}
+
+	got := h.authed(&protocol.Request{Op: protocol.OpGet, TokenID: "a"})
+	if !got.Found || got.Secret != "sa" {
+		t.Errorf("get after import: found=%v secret=%q, want true/%q", got.Found, got.Secret, "sa")
+	}
+}
+
+// Without ReplaceNewer, importing over an existing token must leave it
+// untouched, no matter how new the imported entry is.
+func TestImportDefaultDoesNotReplace(t *testing.T) {
+	h := start(t)
+	h.unlock()
+
+	if resp := h.authed(&protocol.Request{Op: protocol.OpAdd, TokenID: "tok", Secret: "original"}); resp.Error != "" {
+		t.Fatalf("add: %s", resp.Error)
+	}
+
+	future := time.Now().Add(time.Hour).Truncate(time.Second)
+	resp := h.authed(&protocol.Request{Op: protocol.OpImport, Entries: []protocol.Entry{
+		{TokenID: "tok", Secret: "incoming", UpdatedAt: future},
+	}})
+	if resp.Error != "" {
+		t.Fatalf("import: %s", resp.Error)
+	}
+	if resp.Import == nil || resp.Import.Skipped != 1 {
+		t.Errorf("import stats = %+v, want 1 skipped", resp.Import)
+	}
+
+	got := h.authed(&protocol.Request{Op: protocol.OpGet, TokenID: "tok"})
+	if got.Secret != "original" {
+		t.Errorf("secret after import = %q, want it left as %q", got.Secret, "original")
+	}
+}
+
+// With ReplaceNewer, an import must overwrite an existing token when the
+// imported entry is strictly newer.
+func TestImportReplaceNewerOverwrites(t *testing.T) {
+	h := start(t)
+	h.unlock()
+
+	if resp := h.authed(&protocol.Request{Op: protocol.OpAdd, TokenID: "tok", Secret: "original"}); resp.Error != "" {
+		t.Fatalf("add: %s", resp.Error)
+	}
+
+	future := time.Now().Add(time.Hour).Truncate(time.Second)
+	resp := h.authed(&protocol.Request{Op: protocol.OpImport, ReplaceNewer: true, Entries: []protocol.Entry{
+		{TokenID: "tok", Secret: "incoming", UpdatedAt: future},
+	}})
+	if resp.Error != "" {
+		t.Fatalf("import: %s", resp.Error)
+	}
+	if resp.Import == nil || resp.Import.Replaced != 1 {
+		t.Errorf("import stats = %+v, want 1 replaced", resp.Import)
+	}
+
+	got := h.authed(&protocol.Request{Op: protocol.OpGet, TokenID: "tok"})
+	if got.Secret != "incoming" {
+		t.Errorf("secret after import = %q, want %q", got.Secret, "incoming")
+	}
+}
+
+func TestImportRejectsEmptyTokenID(t *testing.T) {
+	h := start(t)
+	h.unlock()
+
+	resp := h.authed(&protocol.Request{Op: protocol.OpImport, Entries: []protocol.Entry{{TokenID: ""}}})
+	if resp.Error == "" {
+		t.Error("import with an empty token id succeeded, want an error")
+	}
+}
+
 // Only one daemon may own the sockets, so a second instance must be refused
 // rather than stealing them from the first.
 func TestSecondDaemonRefused(t *testing.T) {
