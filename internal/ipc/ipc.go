@@ -257,6 +257,7 @@ func removeStaleSocket(path string) error {
 }
 
 // checkPeerUID requires the connection's peer to run as the current UID.
+// Reading the credential itself is platform-specific; see peerUID.
 func checkPeerUID(conn net.Conn) error {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
@@ -267,18 +268,18 @@ func checkPeerUID(conn net.Conn) error {
 		return fmt.Errorf("access socket: %w", err)
 	}
 
-	var cred *unix.Ucred
+	var uid uint32
 	var credErr error
 	if err := raw.Control(func(fd uintptr) {
-		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+		uid, credErr = peerUID(int(fd))
 	}); err != nil {
 		return fmt.Errorf("access socket: %w", err)
 	}
 	if credErr != nil {
 		return fmt.Errorf("read peer credentials: %w", credErr)
 	}
-	if want := uint32(os.Getuid()); cred.Uid != want {
-		return fmt.Errorf("peer uid %d is not %d", cred.Uid, want)
+	if want := uint32(os.Getuid()); uid != want {
+		return fmt.Errorf("peer uid %d is not %d", uid, want)
 	}
 	return nil
 }

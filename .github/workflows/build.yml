@@ -1,0 +1,35 @@
+name: build
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        # Both OSes matter here, not just Go versions: cipherstore uses CGO
+        # (SQLCipher) plus OS-specific syscalls for process hardening and
+        # unix-socket peer credentials, so Linux and macOS each have their
+        # own implementation that needs to actually compile and pass tests.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      GO111MODULE: "on"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...

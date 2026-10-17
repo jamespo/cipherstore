@@ -1,0 +1,88 @@
+version: 2
+
+env:
+  - GO111MODULE=on
+
+before:
+  hooks:
+    - go mod tidy
+
+# Only Linux is built here: it is the one OS this project can cross-compile
+# for from a single runner (via a plain cross-gcc for arm64). macOS binaries
+# are built natively on macos-13/macos-14 runners in release.yml instead,
+# since CGO (needed for SQLCipher) cannot realistically be cross-compiled for
+# Darwin from Linux, and are merged into the same release afterwards.
+builds:
+  - id: cipherstore
+    binary: cipherstore
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/jamespo/cipherstore/internal/cli.version={{ .Version }}
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - linux
+    goarch:
+      - amd64
+
+  - id: cipherstore-arm64
+    binary: cipherstore
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/jamespo/cipherstore/internal/cli.version={{ .Version }}
+    env:
+      - CGO_ENABLED=1
+      - CC=aarch64-linux-gnu-gcc
+    goos:
+      - linux
+    goarch:
+      - arm64
+
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - README.md
+      - contrib/cipherstore.service
+
+nfpms:
+  - ids:
+      - cipherstore
+      - cipherstore-arm64
+    vendor: jamespo
+    homepage: "https://github.com/jamespo/cipherstore"
+    maintainer: "James Powell <jamespo@gmail.com>"
+    description: "An encrypted store for logins and other secrets"
+    license: MIT
+    formats:
+      - apk
+      - deb
+      - rpm
+      - archlinux
+    bindir: /usr/bin
+    contents:
+      # A vendor-provided *user* systemd unit. /usr/lib/systemd/user is the
+      # distro-wide location systemd scans for `systemctl --user` on every
+      # account, matching how the service is documented to be installed
+      # manually in contrib/cipherstore.service itself.
+      - src: contrib/cipherstore.service
+        dst: /usr/lib/systemd/user/cipherstore.service
+        file_info:
+          mode: 0644
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
