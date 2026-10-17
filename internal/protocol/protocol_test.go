@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"net"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -23,8 +24,12 @@ func pipe(t *testing.T) (client, server net.Conn) {
 func socketPair() (net.Conn, net.Conn, error) {
 	l, err := net.Listen("unix", "")
 	if err != nil {
-		// Autobind is Linux-specific; fall back to a temp path.
-		return nil, nil, err
+		// Autobind (binding an empty address to get a kernel-assigned name)
+		// is Linux-specific; fall back to a real, short-lived socket file.
+		l, err = listenTempSocket()
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	defer l.Close()
 
@@ -48,6 +53,35 @@ func socketPair() (net.Conn, net.Conn, error) {
 		return nil, nil, r.err
 	}
 	return client, r.conn, nil
+}
+
+// listenTempSocket binds a unix socket at a short-lived temporary path,
+// removing the file once the listener closes.
+func listenTempSocket() (net.Listener, error) {
+	f, err := os.CreateTemp("", "cipherstore-test-*.sock")
+	if err != nil {
+		return nil, err
+	}
+	path := f.Name()
+	f.Close()
+	os.Remove(path) // net.Listen creates the socket file itself.
+
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	return &unlinkOnCloseListener{Listener: l, path: path}, nil
+}
+
+type unlinkOnCloseListener struct {
+	net.Listener
+	path string
+}
+
+func (l *unlinkOnCloseListener) Close() error {
+	err := l.Listener.Close()
+	os.Remove(l.path)
+	return err
 }
 
 func TestRoundTripRequest(t *testing.T) {

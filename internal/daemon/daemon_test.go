@@ -18,6 +18,22 @@ import (
 
 const testPassword = "correct horse battery staple"
 
+// listenRelative binds a unix socket by chdir'ing into path's directory and
+// binding its bare file name, exactly as ipc.Listen does, so a long test
+// temp-dir path cannot overflow sockaddr_un.sun_path.
+func listenRelative(path string) (net.Listener, error) {
+	dir, name := filepath.Split(path)
+	orig, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chdir(dir); err != nil {
+		return nil, err
+	}
+	defer os.Chdir(orig)
+	return net.Listen("unix", name)
+}
+
 // harness is a running daemon plus the paths needed to talk to it.
 type harness struct {
 	t      *testing.T
@@ -577,7 +593,11 @@ func TestStartOverStaleSocketAndLock(t *testing.T) {
 
 	// Simulate the debris a SIGKILL leaves: a socket file with nothing
 	// listening, plus a lock file nobody holds an flock on.
-	stale, err := net.Listen("unix", layout.ControlSocket)
+	//
+	// Bound by file name from inside the directory, as cipherstore's own
+	// Listen does: sockaddr_un.sun_path is much shorter on Darwin (104 bytes)
+	// than Linux (108), and t.TempDir()'s path alone can exceed either.
+	stale, err := listenRelative(layout.ControlSocket)
 	if err != nil {
 		t.Fatalf("create stale socket: %v", err)
 	}
