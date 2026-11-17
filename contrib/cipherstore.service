@@ -21,8 +21,10 @@
 [Unit]
 Description=cipherstore encrypted secret store
 Documentation=https://github.com/jamespo/cipherstore
-# The store lives under $HOME, so do not start before it is available.
-After=default.target
+# No After=default.target: WantedBy=default.target already makes the target
+# order itself after this unit, so adding it here would create an ordering
+# cycle that systemd breaks by dropping a job -- possibly this one. $HOME is
+# always available to the user manager, so no ordering is needed.
 
 [Service]
 Type=simple
