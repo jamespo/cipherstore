@@ -57,7 +57,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.state = os.path.join(self.tmp.name, "cipherstore")
         os.mkdir(self.state, 0o700)
-        self.client = cipherstore.Client(self.state)
+        self.client = cipherstore.CipherStore(self.state)
         self.daemons = []
 
     def tearDown(self):
@@ -106,6 +106,8 @@ class TestOperations(Base):
 
     def test_get_missing(self):
         with self.assertRaises(cipherstore.NotFoundError):
+            self.client.get("nope")
+        with self.assertRaises(cipherstore.CipherStore.NotFoundError):
             self.client.get("nope")
         with self.assertRaises(KeyError):
             self.client.get("nope")
@@ -171,7 +173,7 @@ class TestSecurityChecks(Base):
         os.symlink(self.state, link)
         self.serve("authed", lambda r: {"found": True, "secret": "x"})
         with self.assertRaisesRegex(cipherstore.CipherstoreError, "symlink"):
-            cipherstore.Client(link).get("foo")
+            cipherstore.CipherStore(link).get("foo")
 
     def test_permissive_state_dir_rejected(self):
         os.chmod(self.state, 0o755)
@@ -185,13 +187,13 @@ class TestSecurityChecks(Base):
 
     def test_peer_uid_mismatch_rejected(self):
         self.serve("authed", lambda r: {"found": True, "secret": "x"})
-        orig = cipherstore._peer_uid
-        cipherstore._peer_uid = lambda s: os.getuid() + 1
+        orig = cipherstore.CipherStore.__dict__["_peer_uid"]
+        cipherstore.CipherStore._peer_uid = staticmethod(lambda s: os.getuid() + 1)
         try:
             with self.assertRaisesRegex(cipherstore.CipherstoreError, "peer uid"):
                 self.client.get("foo")
         finally:
-            cipherstore._peer_uid = orig
+            cipherstore.CipherStore._peer_uid = orig
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux-only fallback")
@@ -210,7 +212,7 @@ class TestLongPath(unittest.TestCase):
                 os.chdir(cwd)
             d.path = os.path.join(state, "authed")
             try:
-                self.assertEqual(cipherstore.Client(state).get("foo"), "long")
+                self.assertEqual(cipherstore.CipherStore(state).get("foo"), "long")
             finally:
                 d.close()
 

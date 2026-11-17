@@ -9,19 +9,23 @@ Copy it into your project, or put its directory on `PYTHONPATH`.
 
 ## Library
 
+Everything is in the `CipherStore` class:
+
 ```python
-import cipherstore
+from cipherstore import CipherStore
 
-token = cipherstore.get("github-token")          # raises NotFoundError if absent
-token = cipherstore.get("github-token", None)    # or returns the default
+c = CipherStore()
 
-created = cipherstore.add("github-token", "ghp_...", comment="CI token")
-cipherstore.delete("github-token")
+token = c.get("github-token")          # raises CipherStore.NotFoundError if absent
+token = c.get("github-token", None)    # or returns the default
 
-for e in cipherstore.list_entries():             # Entry(token_id, comment, updated_at)
+created = c.add("github-token", "ghp_...", comment="CI token")
+c.delete("github-token")
+
+for e in c.list_entries():             # CipherStore.Entry(token_id, comment, updated_at)
     print(e.token_id, e.comment, e.updated_at)
 
-if cipherstore.is_unlocked():
+if c.is_unlocked():
     ...
 ```
 
@@ -29,16 +33,17 @@ if cipherstore.is_unlocked():
 is. Pass `comment=""` to clear it. This matches the Go CLI.
 
 To use a state directory other than `$XDG_STATE_HOME/cipherstore` (by default
-`~/.local/state/cipherstore`), create a client for it:
+`~/.local/state/cipherstore`), pass it to the constructor:
 
 ```python
-client = cipherstore.Client("/path/to/state/cipherstore")
-client.get("foo")
+c = CipherStore("/path/to/state/cipherstore")
 ```
 
 ### Exceptions
 
-All exceptions derive from `cipherstore.CipherstoreError`.
+All exceptions derive from `CipherstoreError`. Each one is also an attribute
+of the class (for example `CipherStore.LockedError`), so you only need to
+import `CipherStore`.
 
 | Exception | Meaning |
 | --- | --- |
