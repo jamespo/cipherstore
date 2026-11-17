@@ -161,6 +161,19 @@ is discarded. Startup failures are still reported to the caller over a
 dedicated pipe, but for ongoing logs use systemd (or run `start` in the
 foreground).
 
+## Python client
+
+`contrib/python/cipherstore.py` is a single-file, standard-library-only Python
+client. It talks to the daemon's sockets directly, with the same symlink,
+ownership and peer-UID checks as the Go client:
+
+```python
+import cipherstore
+token = cipherstore.get("github-token")
+```
+
+For details, see [contrib/python/README.md](contrib/python/README.md).
+
 ## Files
 
 | Path | Mode | Purpose |
