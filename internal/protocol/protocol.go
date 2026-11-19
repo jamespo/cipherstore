@@ -68,6 +68,11 @@ type Request struct {
 	// leaves any existing comment untouched.
 	SetComment bool `json:"set_comment,omitempty"`
 
+	// NoOverwrite, on OpAdd, makes the daemon refuse to replace an existing
+	// token: nothing is written and the response has Exists set. When false,
+	// OpAdd is an upsert.
+	NoOverwrite bool `json:"no_overwrite,omitempty"`
+
 	// Entries carries the entries to write on OpImport.
 	Entries []Entry `json:"entries,omitempty"`
 
@@ -111,6 +116,7 @@ type Response struct {
 	Secret  string       `json:"secret,omitempty"`
 	Found   bool         `json:"found,omitempty"`
 	Created bool         `json:"created,omitempty"`
+	Exists  bool         `json:"exists,omitempty"`
 	Entries []Entry      `json:"entries,omitempty"`
 	Status  *Status      `json:"status,omitempty"`
 	Import  *ImportStats `json:"import,omitempty"`

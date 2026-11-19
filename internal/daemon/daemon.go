@@ -319,7 +319,10 @@ func (d *Daemon) doAdd(ctx context.Context, req *protocol.Request) protocol.Resp
 	if req.TokenID == "" {
 		return errResponse(errors.New("token id must not be empty"))
 	}
-	created, err := st.Put(ctx, req.TokenID, req.Secret, req.Comment, req.SetComment)
+	created, err := st.Put(ctx, req.TokenID, req.Secret, req.Comment, req.SetComment, req.NoOverwrite)
+	if errors.Is(err, store.ErrExists) {
+		return protocol.Response{Exists: true}
+	}
 	if err != nil {
 		return errResponse(err)
 	}

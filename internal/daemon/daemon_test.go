@@ -168,6 +168,32 @@ func TestAuthedSocketTracksLockState(t *testing.T) {
 	waitFor(t, h.layout.AuthedSocket, false)
 }
 
+// An add with NoOverwrite must leave an existing token alone and say so.
+func TestAddNoOverwrite(t *testing.T) {
+	h := start(t)
+	h.unlock()
+
+	resp := h.authed(&protocol.Request{Op: protocol.OpAdd, TokenID: "tok", Secret: "v1", NoOverwrite: true})
+	if resp.Error != "" || !resp.Created || resp.Exists {
+		t.Fatalf("first add: error=%q created=%v exists=%v, want created", resp.Error, resp.Created, resp.Exists)
+	}
+
+	resp = h.authed(&protocol.Request{Op: protocol.OpAdd, TokenID: "tok", Secret: "v2", NoOverwrite: true})
+	if resp.Error != "" || resp.Created || !resp.Exists {
+		t.Fatalf("second add: error=%q created=%v exists=%v, want exists", resp.Error, resp.Created, resp.Exists)
+	}
+
+	resp = h.authed(&protocol.Request{Op: protocol.OpGet, TokenID: "tok"})
+	if resp.Secret != "v1" {
+		t.Errorf("secret = %q, want it untouched as %q", resp.Secret, "v1")
+	}
+
+	resp = h.authed(&protocol.Request{Op: protocol.OpAdd, TokenID: "tok", Secret: "v3"})
+	if resp.Error != "" || resp.Exists {
+		t.Fatalf("upsert add: error=%q exists=%v", resp.Error, resp.Exists)
+	}
+}
+
 func TestSecretOperations(t *testing.T) {
 	h := start(t)
 	h.unlock()

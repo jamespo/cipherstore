@@ -81,14 +81,17 @@ These require an unlocked store.
 | --- | --- |
 | `cipherstore get <tokenid>` | Print the secret. |
 | `cipherstore get -n <tokenid>` | Print the secret with no trailing newline. |
-| `cipherstore add <tokenid> [secret] [comment]` | Add or update a token. Prompts for the secret if omitted. |
+| `cipherstore add <tokenid> [secret] [comment]` | Add a token. Prompts for the secret if omitted. |
+| `cipherstore add -force <tokenid> [secret] [comment]` | Add a token, or update it if it already exists. |
 | `cipherstore add -stdin <tokenid> [comment]` | Read the secret from standard input. |
 | `cipherstore delete <tokenid>` | Remove a token. |
 | `cipherstore list` | List token IDs, comments and update times. |
 
-`add` is an upsert. When you supply no comment, an existing comment is left
-alone, so `cipherstore add github <rotated-token>` rotates a secret without
-losing its label. Pass an explicit `""` to clear a comment.
+`add` refuses to overwrite an existing token: it exits with status 1 and
+changes nothing unless you pass `-force`. With `-force`, when you supply no
+comment an existing comment is left alone, so
+`cipherstore add -force github <rotated-token>` rotates a secret without losing
+its label. Pass an explicit `""` to clear a comment.
 
 ### Getting secrets in without exposing them
 
@@ -97,13 +100,15 @@ A secret on the command line is visible to every process on the machine via
 that way because it is convenient, but prefer one of these:
 
 ```sh
-cipherstore add github                     # prompts, echo off
+cipherstore add github                     # prompts, shows * per keystroke
 pwgen -s 32 1 | cipherstore add -stdin github "work account"
 cipherstore add -stdin github < token.txt
 ```
 
-`unlock` reads its password from `/dev/tty` with echo disabled, so a redirected
-stdout or stderr does not capture the prompt or divert the password. When no
+`unlock` and the `add` prompt read from `/dev/tty`, showing a `*` for each
+character typed, so a redirected stdout or stderr does not capture the prompt
+or divert the password. Set `CIPHERSTORE_NOECHO` (to any value) to echo
+nothing at all, not even the length of what you type. When no
 terminal is available it falls back to reading one line from stdin, which is
 what makes non-interactive use possible:
 

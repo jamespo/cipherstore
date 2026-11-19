@@ -29,7 +29,7 @@ func TestRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t, testDBPath(t), "hunter2")
 
-	created, err := s.Put(ctx, "github", "ghp_token", "work", true)
+	created, err := s.Put(ctx, "github", "ghp_token", "work", true, false)
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestDelete(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t, testDBPath(t), "pw")
 
-	if _, err := s.Put(ctx, "tok", "sec", "", true); err != nil {
+	if _, err := s.Put(ctx, "tok", "sec", "", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := s.Delete(ctx, "tok"); err != nil {
@@ -87,11 +87,11 @@ func TestPutPreservesCommentWhenNotSet(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t, testDBPath(t), "pw")
 
-	if _, err := s.Put(ctx, "tok", "v1", "original", true); err != nil {
+	if _, err := s.Put(ctx, "tok", "v1", "original", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	created, err := s.Put(ctx, "tok", "v2", "", false)
+	created, err := s.Put(ctx, "tok", "v2", "", false, false)
 	if err != nil {
 		t.Fatalf("Put update: %v", err)
 	}
@@ -115,10 +115,10 @@ func TestPutReplacesCommentWhenSet(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t, testDBPath(t), "pw")
 
-	if _, err := s.Put(ctx, "tok", "v1", "original", true); err != nil {
+	if _, err := s.Put(ctx, "tok", "v1", "original", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if _, err := s.Put(ctx, "tok", "v2", "replaced", true); err != nil {
+	if _, err := s.Put(ctx, "tok", "v2", "replaced", true, false); err != nil {
 		t.Fatalf("Put update: %v", err)
 	}
 
@@ -136,7 +136,7 @@ func TestListIsOrderedAndOmitsSecrets(t *testing.T) {
 	s := openStore(t, testDBPath(t), "pw")
 
 	for _, tok := range []string{"zebra", "alpha", "middle"} {
-		if _, err := s.Put(ctx, tok, "secret-"+tok, "c-"+tok, true); err != nil {
+		if _, err := s.Put(ctx, tok, "secret-"+tok, "c-"+tok, true, false); err != nil {
 			t.Fatalf("Put %q: %v", tok, err)
 		}
 	}
@@ -169,7 +169,7 @@ func TestReopenWithSamePassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if _, err := s1.Put(ctx, "tok", "sec", "c", true); err != nil {
+	if _, err := s1.Put(ctx, "tok", "sec", "c", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if err := s1.Close(); err != nil {
@@ -198,7 +198,7 @@ func TestWrongPasswordRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := s.Put(context.Background(), "tok", "sec", "", true); err != nil {
+	if _, err := s.Put(context.Background(), "tok", "sec", "", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	s.Close()
@@ -217,7 +217,7 @@ func TestWrongPasswordDoesNotPoisonDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := s.Put(ctx, "tok", "sec", "", true); err != nil {
+	if _, err := s.Put(ctx, "tok", "sec", "", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	s.Close()
@@ -272,7 +272,7 @@ func TestHostilePasswords(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
-			if _, err := s.Put(ctx, "tok", "sec", "", true); err != nil {
+			if _, err := s.Put(ctx, "tok", "sec", "", true, false); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
 			if err := s.Close(); err != nil {
@@ -324,7 +324,7 @@ func TestHostileValues(t *testing.T) {
 
 	for i, v := range values {
 		tok := "tok" + string(rune('a'+i))
-		if _, err := s.Put(ctx, tok, v, v, true); err != nil {
+		if _, err := s.Put(ctx, tok, v, v, true, false); err != nil {
 			t.Fatalf("Put %q: %v", tok, err)
 		}
 		got, err := s.Get(ctx, tok)
@@ -354,7 +354,7 @@ func TestExportIncludesSecrets(t *testing.T) {
 	s := openStore(t, testDBPath(t), "pw")
 
 	for _, tok := range []string{"zebra", "alpha"} {
-		if _, err := s.Put(ctx, tok, "secret-"+tok, "c-"+tok, true); err != nil {
+		if _, err := s.Put(ctx, tok, "secret-"+tok, "c-"+tok, true, false); err != nil {
 			t.Fatalf("Put %q: %v", tok, err)
 		}
 	}
@@ -497,7 +497,7 @@ func TestNULPasswordRejected(t *testing.T) {
 func TestDatabaseFileIsNotWorldReadable(t *testing.T) {
 	path := testDBPath(t)
 	s := openStore(t, path, "pw")
-	if _, err := s.Put(context.Background(), "tok", "sec", "", true); err != nil {
+	if _, err := s.Put(context.Background(), "tok", "sec", "", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -515,7 +515,7 @@ func TestDatabaseFileIsNotWorldReadable(t *testing.T) {
 func TestOpenTightensLoosePermissions(t *testing.T) {
 	path := testDBPath(t)
 	s := openStore(t, path, "pw")
-	if _, err := s.Put(context.Background(), "tok", "sec", "", true); err != nil {
+	if _, err := s.Put(context.Background(), "tok", "sec", "", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	s.Close()
@@ -563,7 +563,7 @@ func TestOpenRefusesSymlink(t *testing.T) {
 func TestDatabaseIsEncryptedOnDisk(t *testing.T) {
 	path := testDBPath(t)
 	s := openStore(t, path, "pw")
-	if _, err := s.Put(context.Background(), "mytokenid", "mysupersecret", "mycomment", true); err != nil {
+	if _, err := s.Put(context.Background(), "mytokenid", "mysupersecret", "mycomment", true, false); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	s.Close()
@@ -605,5 +605,33 @@ func TestBuildDSNEncodesKey(t *testing.T) {
 	}
 	if !strings.Contains(dsn, "_pragma_key=") {
 		t.Errorf("DSN %q is missing _pragma_key", dsn)
+	}
+}
+
+// With noOverwrite, Put must refuse to touch an existing token -- secret,
+// comment and timestamp all unchanged -- but still create a new one.
+func TestPutNoOverwrite(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t, testDBPath(t), "pw")
+
+	created, err := s.Put(ctx, "tok", "v1", "original", true, true)
+	if err != nil {
+		t.Fatalf("Put new with noOverwrite: %v", err)
+	}
+	if !created {
+		t.Error("Put of a new token reported created=false")
+	}
+
+	_, err = s.Put(ctx, "tok", "v2", "replaced", true, true)
+	if !errors.Is(err, ErrExists) {
+		t.Fatalf("Put existing with noOverwrite error = %v, want ErrExists", err)
+	}
+
+	got, err := s.Get(ctx, "tok")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Secret != "v1" || got.Comment != "original" {
+		t.Errorf("entry = %q/%q, want it untouched as %q/%q", got.Secret, got.Comment, "v1", "original")
 	}
 }

@@ -389,20 +389,21 @@ func (e *env) cmdGet(args []string) error {
 func (e *env) cmdAdd(args []string) error {
 	fs := newFlagSet("add")
 	fromStdin := fs.Bool("stdin", false, "read the secret from standard input instead of the command line")
+	force := fs.Bool("force", false, "update the token if it already exists")
 	if err := fs.Parse(args); err != nil {
 		return errUsage
 	}
 	rest := fs.Args()
 	if len(rest) == 0 || len(rest) > 3 {
-		return fmt.Errorf("%w: add <tokenid> [secret] [comment]", errUsage)
+		return fmt.Errorf("%w: add [-force] <tokenid> [secret] [comment]", errUsage)
 	}
 
-	req := &protocol.Request{Op: protocol.OpAdd, TokenID: rest[0]}
+	req := &protocol.Request{Op: protocol.OpAdd, TokenID: rest[0], NoOverwrite: !*force}
 
 	switch {
 	case *fromStdin:
 		if len(rest) > 2 {
-			return fmt.Errorf("%w: with -stdin, use add -stdin <tokenid> [comment]", errUsage)
+			return fmt.Errorf("%w: with -stdin, use add -stdin [-force] <tokenid> [comment]", errUsage)
 		}
 		secret, err := readAllTrimNewline(e.stdin)
 		if err != nil {
@@ -433,6 +434,9 @@ func (e *env) cmdAdd(args []string) error {
 	resp, err := e.sendAuthed(req)
 	if err != nil {
 		return err
+	}
+	if resp.Exists {
+		return fmt.Errorf("%q already exists; use add -force to update it", req.TokenID)
 	}
 	if resp.Created {
 		fmt.Fprintf(e.stdout, "added %s\n", req.TokenID)
@@ -636,10 +640,11 @@ Daemon:
 
 Secrets (require an unlocked store):
   get [-n] <tokenid>         Print the secret for tokenid
-  add <tokenid> [secret] [comment]
-                             Add or update a token; the secret is prompted for
-                             when omitted
-  add -stdin <tokenid> [comment]
+  add [-force] <tokenid> [secret] [comment]
+                             Add a token; the secret is prompted for when
+                             omitted. An existing token is only updated with
+                             -force
+  add -stdin [-force] <tokenid> [comment]
                              Read the secret from standard input
   delete <tokenid>           Remove a token
   list                       List token ids, comments and update times
@@ -663,5 +668,9 @@ Exit status:
 
 Passing a secret as a command-line argument exposes it to other processes via
 the process table and to your shell history. Prefer the prompt or -stdin.
+
+Environment:
+  CIPHERSTORE_NOECHO         When set, password and secret prompts echo
+                             nothing instead of a * per keystroke
 `)
 }

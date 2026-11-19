@@ -28,6 +28,10 @@ import (
 // ErrNotFound is returned when a token ID is not present in the store.
 var ErrNotFound = errors.New("token not found")
 
+// ErrExists is returned by Put when noOverwrite is set and the token is
+// already present.
+var ErrExists = errors.New("token already exists")
+
 // ErrBadPassword is returned when the passphrase does not decrypt the database.
 var ErrBadPassword = errors.New("incorrect password or corrupt database")
 
@@ -151,9 +155,11 @@ func (s *Store) Get(ctx context.Context, tokenID string) (Entry, error) {
 }
 
 // Put inserts or updates tokenID's secret. When setComment is false and the
-// token already exists, its existing comment is preserved. It reports whether
-// a new row was created.
-func (s *Store) Put(ctx context.Context, tokenID, secret, comment string, setComment bool) (created bool, err error) {
+// token already exists, its existing comment is preserved. When noOverwrite is
+// true and the token already exists, nothing is written and ErrExists is
+// returned; the check and the write share a transaction, so it is race-free.
+// It reports whether a new row was created.
+func (s *Store) Put(ctx context.Context, tokenID, secret, comment string, setComment, noOverwrite bool) (created bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin transaction: %w", err)
@@ -167,6 +173,10 @@ func (s *Store) Put(ctx context.Context, tokenID, secret, comment string, setCom
 		created = true
 	case err != nil:
 		return false, fmt.Errorf("check %q: %w", tokenID, err)
+	}
+
+	if noOverwrite && !created {
+		return false, ErrExists
 	}
 
 	if !setComment && !created {
