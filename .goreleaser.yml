@@ -9,7 +9,7 @@ before:
 
 # Only Linux is built here: it is the one OS this project can cross-compile
 # for from a single runner (via a plain cross-gcc for arm64). macOS binaries
-# are built natively on macos-13/macos-14 runners in release.yml instead,
+# are built natively on a macos-latest runner in release.yml instead,
 # since CGO (needed for SQLCipher) cannot realistically be cross-compiled for
 # Darwin from Linux, and are merged into the same release afterwards.
 builds:

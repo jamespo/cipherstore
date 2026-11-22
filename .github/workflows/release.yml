@@ -60,7 +60,7 @@ jobs:
   # Intel runner -- GitHub retired the free one (macos-13) in December 2025,
   # and its replacements are a paid "larger runners" tier.
   macos:
-    runs-on: macos-14
+    runs-on: macos-latest
     strategy:
       matrix:
         include:
