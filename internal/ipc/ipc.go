@@ -3,19 +3,29 @@
 // Two defences are layered here:
 //
 //  1. Path safety. The socket's parent directory must be a non-symlink
-//     directory we own with mode 0700, and the socket itself must be a
-//     non-symlink socket we own. An attacker who could plant a symlink where
-//     the daemon expects a socket would otherwise receive the passphrase that
-//     `cipherstore unlock` sends.
+//     directory that nobody but its owner can write to, and the socket itself
+//     must be a non-symlink socket with the same owner. An attacker who could
+//     plant a symlink where the daemon expects a socket would otherwise
+//     receive the passphrase that `cipherstore unlock` sends.
 //
-//  2. Peer credentials. Both ends read SO_PEERCRED and require the other end's
-//     UID to match their own. This closes the gap left by the inevitable
-//     time-of-check/time-of-use window in any path-based check: even if a peer
-//     managed to interpose, it would have to do so as the same UID, which
-//     already has full access to the user's files.
+//  2. Peer credentials. Both ends ask the kernel who is on the other end
+//     (SO_PEERCRED on Linux, LOCAL_PEERCRED on Darwin). This closes the gap
+//     left by the inevitable time-of-check/time-of-use window in any
+//     path-based check.
+//
+// How strict each check is depends on the access policy:
+//
+//   - Solo (the default): the directory and socket must be ours, the
+//     directory must be 0700, and the peer must run as our UID on both sides.
+//   - Group and All: the daemon accepts peers allowed by the policy (members
+//     of the group, or anyone). The client accepts a daemon run by another
+//     user, but requires the directory, the socket and the listening process
+//     to all belong to that same user, and the directory not to be writable by
+//     anyone else.
 package ipc
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -24,6 +34,9 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/jamespo/cipherstore/internal/access"
+	"github.com/jamespo/cipherstore/internal/paths"
 )
 
 // procMu serialises the process-global state Listen and Dial have to touch:
@@ -78,17 +91,19 @@ func inSocketDir(path string, fn func(name string) error) error {
 
 // Listener wraps a UNIX socket listener and removes the socket file on Close.
 type Listener struct {
-	inner net.Listener
-	path  string
+	inner  net.Listener
+	path   string
+	policy access.Policy
 }
 
-// Listen creates a UNIX socket at path with the given permissions.
+// Listen creates a UNIX socket at path with the ownership and permissions the
+// policy requires. Accept then admits only the peers the policy allows.
 //
 // A stale socket left behind by a crashed daemon is removed, but only after
 // confirming it really is a socket we own. Callers must already hold the
 // daemon lock, so no live daemon can be using it.
-func Listen(path string, mode os.FileMode) (*Listener, error) {
-	if err := checkParentDir(path); err != nil {
+func Listen(path string, policy access.Policy) (*Listener, error) {
+	if err := paths.CheckDir(filepath.Dir(path), policy); err != nil {
 		return nil, err
 	}
 	if err := removeStaleSocket(path); err != nil {
@@ -114,7 +129,17 @@ func Listen(path string, mode os.FileMode) (*Listener, error) {
 		return nil, fmt.Errorf("listen on %s: %w", path, err)
 	}
 
-	if err := os.Chmod(path, mode); err != nil {
+	// The socket was created 0700 under the clamped umask. Set its group
+	// before opening the mode up, so it is never group-accessible while it
+	// still has the wrong group.
+	if policy.Mode == access.Group {
+		if err := os.Lchown(path, -1, policy.GID); err != nil {
+			inner.Close()
+			os.Remove(path)
+			return nil, fmt.Errorf("set group of %s to gid %d: %w", path, policy.GID, err)
+		}
+	}
+	if err := os.Chmod(path, policy.SocketPerm()); err != nil {
 		inner.Close()
 		os.Remove(path)
 		return nil, fmt.Errorf("chmod %s: %w", path, err)
@@ -125,18 +150,18 @@ func Listen(path string, mode os.FileMode) (*Listener, error) {
 	if ul, ok := inner.(*net.UnixListener); ok {
 		ul.SetUnlinkOnClose(false)
 	}
-	return &Listener{inner: inner, path: path}, nil
+	return &Listener{inner: inner, path: path, policy: policy}, nil
 }
 
-// Accept returns the next connection whose peer runs as the same UID.
-// Connections from other users are closed and skipped rather than returned.
+// Accept returns the next connection whose peer the policy allows.
+// Connections from anyone else are closed and skipped rather than returned.
 func (l *Listener) Accept() (net.Conn, error) {
 	for {
 		conn, err := l.inner.Accept()
 		if err != nil {
 			return nil, err
 		}
-		if err := checkPeerUID(conn); err != nil {
+		if err := checkPeerAllowed(conn, l.policy); err != nil {
 			conn.Close()
 			// Not fatal: a rejected peer must not take the daemon down.
 			continue
@@ -162,8 +187,13 @@ func (l *Listener) Path() string { return l.path }
 
 // Dial connects to a cipherstore socket, verifying both the path and the
 // listening process's credentials before returning.
-func Dial(path string) (net.Conn, error) {
-	if err := checkParentDir(path); err != nil {
+//
+// In solo mode the daemon must be running as us. In group and all modes it may
+// run as another user: the directory's owner, who must also own the socket and
+// be the process actually listening on it.
+func Dial(path string, policy access.Policy) (net.Conn, error) {
+	owner, err := checkClientDir(filepath.Dir(path), policy)
+	if err != nil {
 		return nil, err
 	}
 
@@ -177,7 +207,7 @@ func Dial(path string) (net.Conn, error) {
 	if fi.Mode()&os.ModeSocket == 0 {
 		return nil, fmt.Errorf("%s is not a socket; refusing to connect", path)
 	}
-	if err := checkStatOwner(path, fi); err != nil {
+	if err := checkStatUID(path, fi, owner); err != nil {
 		return nil, err
 	}
 
@@ -194,42 +224,59 @@ func Dial(path string) (net.Conn, error) {
 	}
 	// The path checks above are inherently racy. This is the authoritative
 	// check: ask the kernel who is actually on the other end.
-	if err := checkPeerUID(conn); err != nil {
+	uid, _, err := peerCredentials(conn, false)
+	if err == nil && uid != owner {
+		err = fmt.Errorf("peer uid %d is not %d, the owner of %s", uid, owner, filepath.Dir(path))
+	}
+	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return conn, nil
 }
 
-// checkParentDir validates the directory containing path.
-func checkParentDir(path string) error {
-	dir := filepath.Dir(path)
+// checkClientDir validates the socket directory from the client's side and
+// returns the UID the daemon must be running as.
+func checkClientDir(dir string, policy access.Policy) (uint32, error) {
+	if policy.Mode == access.Solo {
+		if err := paths.CheckSecureDir(dir); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return 0, err
+			}
+			return 0, fmt.Errorf("%w (to use a daemon shared by another user, pass -mode group or -mode all)", err)
+		}
+		return uint32(os.Getuid()), nil
+	}
+
 	fi, err := os.Lstat(dir)
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", dir, err)
+		return 0, fmt.Errorf("stat %s: %w", dir, err)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%s is a symlink; refusing to use it", dir)
+		return 0, fmt.Errorf("%s is a symlink; refusing to use it", dir)
 	}
 	if !fi.IsDir() {
-		return fmt.Errorf("%s is not a directory", dir)
+		return 0, fmt.Errorf("%s is not a directory", dir)
 	}
-	if err := checkStatOwner(dir, fi); err != nil {
-		return err
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("%s: cannot determine owner on this platform", dir)
 	}
-	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-		return fmt.Errorf("%s has permissions %#o; must not be accessible to group or others", dir, perm)
+	// Anyone who can write to the directory can replace the sockets, so only
+	// the owner may.
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return 0, fmt.Errorf("%s has permissions %#o; must not be writable by group or others", dir, perm)
 	}
-	return nil
+	return st.Uid, nil
 }
 
-func checkStatOwner(path string, fi os.FileInfo) error {
+func checkStatUID(path string, fi os.FileInfo, want uint32) error {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
 		return fmt.Errorf("%s: cannot determine owner on this platform", path)
 	}
-	if uid := os.Getuid(); st.Uid != uint32(uid) {
-		return fmt.Errorf("%s is owned by uid %d, not %d; refusing to use it", path, st.Uid, uid)
+	if st.Uid != want {
+		return fmt.Errorf("%s is owned by uid %d, not %d; refusing to use it", path, st.Uid, want)
 	}
 	return nil
 }
@@ -247,7 +294,7 @@ func removeStaleSocket(path string) error {
 	if fi.Mode()&os.ModeSocket == 0 {
 		return fmt.Errorf("%s exists and is not a socket; refusing to replace it", path)
 	}
-	if err := checkStatOwner(path, fi); err != nil {
+	if err := checkStatUID(path, fi, uint32(os.Getuid())); err != nil {
 		return err
 	}
 	if err := os.Remove(path); err != nil {
@@ -256,30 +303,75 @@ func removeStaleSocket(path string) error {
 	return nil
 }
 
-// checkPeerUID requires the connection's peer to run as the current UID.
-// Reading the credential itself is platform-specific; see peerUID.
-func checkPeerUID(conn net.Conn) error {
+// checkPeerAllowed requires the connection's peer to be one the policy lets
+// in: our own UID in solo mode, our UID or a member of the group in group
+// mode, and anyone in all mode.
+func checkPeerAllowed(conn net.Conn, policy access.Policy) error {
+	if policy.Mode == access.All {
+		return nil
+	}
+	uid, gids, err := peerCredentials(conn, policy.Mode == access.Group)
+	if err != nil {
+		return err
+	}
+	if uid == uint32(os.Getuid()) {
+		return nil
+	}
+	if policy.Mode == access.Group {
+		for _, g := range gids {
+			if g == uint32(policy.GID) {
+				return nil
+			}
+		}
+		return fmt.Errorf("peer uid %d is not in group %d", uid, policy.GID)
+	}
+	return fmt.Errorf("peer uid %d is not %d", uid, os.Getuid())
+}
+
+// PeerUID returns the UID of the process on the other end of conn, as the
+// kernel reports it. The daemon uses it to keep the lifecycle operations
+// (unlock, lock, stop) to its owner when the sockets are shared.
+func PeerUID(conn net.Conn) (uint32, error) {
+	uid, _, err := peerCredentials(conn, false)
+	return uid, err
+}
+
+// SocketDirOwner returns the UID owning the directory a socket lives in, which
+// a client may use to tell, before asking for anything, whether it is the
+// daemon's owner. It is advisory only: the daemon makes the real decision.
+func SocketDirOwner(path string) (uint32, error) {
+	fi, err := os.Lstat(filepath.Dir(path))
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("%s: cannot determine owner on this platform", filepath.Dir(path))
+	}
+	return st.Uid, nil
+}
+
+// peerCredentials asks the kernel for the UID of the process on the other end
+// of conn and, when withGroups is set, its group IDs. Reading the credentials
+// is platform-specific; see peerCred.
+func peerCredentials(conn net.Conn, withGroups bool) (uid uint32, gids []uint32, err error) {
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
-		return fmt.Errorf("connection is not a unix socket")
+		return 0, nil, fmt.Errorf("connection is not a unix socket")
 	}
 	raw, err := uc.SyscallConn()
 	if err != nil {
-		return fmt.Errorf("access socket: %w", err)
+		return 0, nil, fmt.Errorf("access socket: %w", err)
 	}
 
-	var uid uint32
 	var credErr error
 	if err := raw.Control(func(fd uintptr) {
-		uid, credErr = peerUID(int(fd))
+		uid, gids, credErr = peerCred(int(fd), withGroups)
 	}); err != nil {
-		return fmt.Errorf("access socket: %w", err)
+		return 0, nil, fmt.Errorf("access socket: %w", err)
 	}
 	if credErr != nil {
-		return fmt.Errorf("read peer credentials: %w", credErr)
+		return 0, nil, fmt.Errorf("read peer credentials: %w", credErr)
 	}
-	if want := uint32(os.Getuid()); uid != want {
-		return fmt.Errorf("peer uid %d is not %d", uid, want)
-	}
-	return nil
+	return uid, gids, nil
 }

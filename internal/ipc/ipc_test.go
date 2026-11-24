@@ -5,7 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/jamespo/cipherstore/internal/access"
 )
 
 // secureDir returns a 0700 directory suitable for sockets.
@@ -21,7 +24,7 @@ func secureDir(t *testing.T) string {
 func TestListenAndDial(t *testing.T) {
 	path := filepath.Join(secureDir(t), "sock")
 
-	l, err := Listen(path, 0o700)
+	l, err := Listen(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -36,7 +39,7 @@ func TestListenAndDial(t *testing.T) {
 		conn.Write([]byte("hello"))
 	}()
 
-	conn, err := Dial(path)
+	conn, err := Dial(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -54,7 +57,7 @@ func TestListenAndDial(t *testing.T) {
 func TestListenSetsRequestedMode(t *testing.T) {
 	path := filepath.Join(secureDir(t), "sock")
 
-	l, err := Listen(path, 0o700)
+	l, err := Listen(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -75,7 +78,7 @@ func TestListenSetsRequestedMode(t *testing.T) {
 func TestCloseUnlinksSocket(t *testing.T) {
 	path := filepath.Join(secureDir(t), "sock")
 
-	l, err := Listen(path, 0o700)
+	l, err := Listen(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -107,7 +110,7 @@ func TestLongPathBeyondSunPathLimit(t *testing.T) {
 	}
 	t.Logf("socket path is %d bytes (limit %d)", len(path), maxSocketPath)
 
-	l, err := Listen(path, 0o700)
+	l, err := Listen(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen on a %d-byte path: %v", len(path), err)
 	}
@@ -121,7 +124,7 @@ func TestLongPathBeyondSunPathLimit(t *testing.T) {
 		conn.Close()
 	}()
 
-	conn, err := Dial(path)
+	conn, err := Dial(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Dial on a %d-byte path: %v", len(path), err)
 	}
@@ -136,7 +139,7 @@ func TestWorkingDirectoryIsRestored(t *testing.T) {
 	}
 
 	path := filepath.Join(secureDir(t), "sock")
-	l, err := Listen(path, 0o700)
+	l, err := Listen(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -151,7 +154,7 @@ func TestWorkingDirectoryIsRestored(t *testing.T) {
 			conn.Close()
 		}
 	}()
-	conn, err := Dial(path)
+	conn, err := Dial(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -167,7 +170,7 @@ func TestDialRefusesSymlink(t *testing.T) {
 	real := filepath.Join(dir, "real")
 	link := filepath.Join(dir, "link")
 
-	l, err := Listen(real, 0o700)
+	l, err := Listen(real, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -177,7 +180,7 @@ func TestDialRefusesSymlink(t *testing.T) {
 		t.Fatalf("Symlink: %v", err)
 	}
 
-	_, err = Dial(link)
+	_, err = Dial(link, access.Policy{})
 	if err == nil {
 		t.Fatal("Dial through a symlink succeeded, want it refused")
 	}
@@ -193,7 +196,7 @@ func TestDialRefusesNonSocket(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if _, err := Dial(path); err == nil {
+	if _, err := Dial(path, access.Policy{}); err == nil {
 		t.Error("Dial on a regular file succeeded, want it refused")
 	}
 }
@@ -201,7 +204,7 @@ func TestDialRefusesNonSocket(t *testing.T) {
 func TestDialMissingSocketReportsNotExist(t *testing.T) {
 	// The CLI distinguishes "daemon not running" from a real fault by testing
 	// for os.ErrNotExist, so this error must stay unwrapped in that respect.
-	_, err := Dial(filepath.Join(secureDir(t), "absent"))
+	_, err := Dial(filepath.Join(secureDir(t), "absent"), access.Policy{})
 	if !os.IsNotExist(err) {
 		t.Errorf("error = %v, want it to satisfy os.IsNotExist", err)
 	}
@@ -213,7 +216,7 @@ func TestRefusesLooseParentDirectory(t *testing.T) {
 	dir := secureDir(t)
 	path := filepath.Join(dir, "sock")
 
-	l, err := Listen(path, 0o700)
+	l, err := Listen(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -224,10 +227,10 @@ func TestRefusesLooseParentDirectory(t *testing.T) {
 	}
 	defer os.Chmod(dir, 0o700)
 
-	if _, err := Dial(path); err == nil {
+	if _, err := Dial(path, access.Policy{}); err == nil {
 		t.Error("Dial with a world-readable parent directory succeeded, want it refused")
 	}
-	if _, err := Listen(filepath.Join(dir, "other"), 0o700); err == nil {
+	if _, err := Listen(filepath.Join(dir, "other"), access.Policy{}); err == nil {
 		t.Error("Listen with a world-readable parent directory succeeded, want it refused")
 	}
 }
@@ -243,7 +246,7 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 	stale.(*net.UnixListener).SetUnlinkOnClose(false)
 	stale.Close()
 
-	l, err := Listen(path, 0o700)
+	l, err := Listen(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen over a stale socket: %v", err)
 	}
@@ -258,7 +261,7 @@ func TestListenRefusesToReplaceNonSocket(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if _, err := Listen(path, 0o700); err == nil {
+	if _, err := Listen(path, access.Policy{}); err == nil {
 		t.Fatal("Listen over a regular file succeeded, want it refused")
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != "do not delete" {
@@ -268,7 +271,7 @@ func TestListenRefusesToReplaceNonSocket(t *testing.T) {
 
 func TestAcceptAcceptsSameUIDPeer(t *testing.T) {
 	path := filepath.Join(secureDir(t), "sock")
-	l, err := Listen(path, 0o700)
+	l, err := Listen(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -285,7 +288,7 @@ func TestAcceptAcceptsSameUIDPeer(t *testing.T) {
 		accepted <- nil
 	}()
 
-	conn, err := Dial(path)
+	conn, err := Dial(path, access.Policy{})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -293,5 +296,147 @@ func TestAcceptAcceptsSameUIDPeer(t *testing.T) {
 
 	if err := <-accepted; err != nil {
 		t.Errorf("Accept rejected a same-uid peer: %v", err)
+	}
+}
+
+// sharedDir returns a directory with the mode and group the policy gives the
+// socket directory.
+func sharedDir(t *testing.T, p access.Policy) string {
+	t.Helper()
+	dir := t.TempDir()
+	if p.Mode == access.Group {
+		if err := os.Chown(dir, -1, p.GID); err != nil {
+			t.Fatalf("Chown: %v", err)
+		}
+	}
+	if err := os.Chmod(dir, p.DirPerm()); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	return dir
+}
+
+func TestListenAppliesSharedModes(t *testing.T) {
+	gid := os.Getgid()
+	for _, p := range []access.Policy{{Mode: access.Group, GID: gid}, {Mode: access.All}} {
+		t.Run(p.Mode.String(), func(t *testing.T) {
+			path := filepath.Join(sharedDir(t, p), "sock")
+			l, err := Listen(path, p)
+			if err != nil {
+				t.Fatalf("Listen: %v", err)
+			}
+			defer l.Close()
+
+			fi, err := os.Lstat(path)
+			if err != nil {
+				t.Fatalf("Lstat: %v", err)
+			}
+			if perm := fi.Mode().Perm(); perm != p.SocketPerm() {
+				t.Errorf("socket mode = %#o, want %#o", perm, p.SocketPerm())
+			}
+			if g := fi.Sys().(*syscall.Stat_t).Gid; p.Mode == access.Group && int(g) != gid {
+				t.Errorf("socket gid = %d, want %d", g, gid)
+			}
+
+			go func() {
+				if conn, err := l.Accept(); err == nil {
+					conn.Close()
+				}
+			}()
+			conn, err := Dial(path, p)
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			conn.Close()
+		})
+	}
+}
+
+// A solo client must not trust a shared directory, and its error should say
+// how to opt in.
+func TestSoloDialRefusesSharedDirWithHint(t *testing.T) {
+	p := access.Policy{Mode: access.All}
+	path := filepath.Join(sharedDir(t, p), "sock")
+	l, err := Listen(path, p)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer l.Close()
+
+	_, err = Dial(path, access.Policy{})
+	if err == nil || !strings.Contains(err.Error(), "-mode") {
+		t.Errorf("Dial(solo) = %v, want a refusal mentioning -mode", err)
+	}
+}
+
+// In the shared modes the client still refuses a directory others can write
+// to, since they could replace the socket.
+func TestSharedDialRefusesWritableDir(t *testing.T) {
+	p := access.Policy{Mode: access.All}
+	dir := sharedDir(t, p)
+	path := filepath.Join(dir, "sock")
+	l, err := Listen(path, p)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer l.Close()
+
+	for _, mode := range []os.FileMode{0o775, 0o757} {
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Dial(path, p); err == nil {
+			t.Errorf("Dial accepted a directory with mode %#o", mode)
+		}
+	}
+	os.Chmod(dir, p.DirPerm())
+}
+
+// Group mode needs the peer's group list from the kernel; check it includes
+// our own primary group.
+func TestPeerCredentialsReportGroups(t *testing.T) {
+	path := filepath.Join(secureDir(t), "sock")
+	l, err := Listen(path, access.Policy{})
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer l.Close()
+
+	type result struct {
+		uid  uint32
+		gids []uint32
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		defer conn.Close()
+		uid, gids, err := peerCredentials(conn, true)
+		got <- result{uid, gids, err}
+	}()
+
+	conn, err := Dial(path, access.Policy{})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	r := <-got
+	if r.err != nil {
+		t.Fatalf("peerCredentials: %v", r.err)
+	}
+	if r.uid != uint32(os.Getuid()) {
+		t.Errorf("uid = %d, want %d", r.uid, os.Getuid())
+	}
+	want := uint32(os.Getgid())
+	found := false
+	for _, g := range r.gids {
+		found = found || g == want
+	}
+	if !found {
+		t.Errorf("gids %v do not include primary gid %d", r.gids, want)
 	}
 }

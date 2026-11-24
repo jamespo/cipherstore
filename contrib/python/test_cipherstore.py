@@ -3,6 +3,8 @@
     python3 -m unittest discover -s contrib/python
 """
 
+import contextlib
+import io
 import json
 import os
 import socket
@@ -10,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cipherstore  # noqa: E402
@@ -59,6 +62,10 @@ class Base(unittest.TestCase):
         os.mkdir(self.state, 0o700)
         self.client = cipherstore.CipherStore(self.state)
         self.daemons = []
+        # Never read the config of the user running the tests.
+        env = unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
 
     def tearDown(self):
         for d in self.daemons:
@@ -194,6 +201,95 @@ class TestSecurityChecks(Base):
                 self.client.get("foo")
         finally:
             cipherstore.CipherStore._peer_uid = orig
+
+
+class TestSharedMode(Base):
+    def setUp(self):
+        super().setUp()
+        os.chmod(self.state, 0o755)
+        self.shared = cipherstore.CipherStore(self.state, shared=True)
+
+    def test_shared_dir_accepted(self):
+        self.serve("authed", lambda r: {"found": True, "secret": "x"})
+        self.assertEqual(self.shared.get("foo"), "x")
+
+    def test_solo_client_refuses_shared_dir_with_hint(self):
+        self.serve("authed", lambda r: {"found": True, "secret": "x"})
+        with self.assertRaisesRegex(cipherstore.CipherstoreError, "shared=True"):
+            self.client.get("foo")
+
+    def test_writable_dir_rejected(self):
+        self.serve("authed", lambda r: {"found": True, "secret": "x"})
+        for mode in (0o775, 0o757):
+            os.chmod(self.state, mode)
+            with self.assertRaisesRegex(cipherstore.CipherstoreError, "writable"):
+                self.shared.get("foo")
+
+    def test_peer_must_be_dir_owner(self):
+        self.serve("authed", lambda r: {"found": True, "secret": "x"})
+        orig = cipherstore.CipherStore.__dict__["_peer_uid"]
+        cipherstore.CipherStore._peer_uid = staticmethod(lambda s: os.getuid() + 1)
+        try:
+            with self.assertRaisesRegex(cipherstore.CipherstoreError, "peer uid"):
+                self.shared.get("foo")
+        finally:
+            cipherstore.CipherStore._peer_uid = orig
+
+    def test_main_global_options(self):
+        self.serve("control", lambda r: {"status": {"unlocked": True, "access": "all"}})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cipherstore.CipherStore.main(["-mode", "all", "-socketpath", self.state, "status"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), "unlocked\n")
+        self.assertEqual(cipherstore.CipherStore.main(["-mode", "bogus", "status"]), 2)
+
+
+@unittest.skipIf(sys.version_info < (3, 11), "tomllib needs Python 3.11")
+class TestConfig(Base):
+    def write(self, body, mode=0o600):
+        path = os.path.join(self.state, "cs.toml")
+        with open(path, "w") as f:
+            f.write(body)
+        os.chmod(path, mode)
+        return path
+
+    def test_from_config(self):
+        os.chmod(self.state, 0o755)
+        self.serve("authed", lambda r: {"found": True, "secret": "x"})
+        path = self.write('mode = "all"\nsocketpath = "%s"\ndbpath = "/ignored"\n' % self.state)
+        c = cipherstore.CipherStore.from_config(path)
+        self.assertTrue(c.shared)
+        self.assertEqual(c.state_dir, self.state)
+        self.assertEqual(c.get("foo"), "x")
+
+    def test_missing_default_is_fine_but_explicit_is_not(self):
+        with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.state}):
+            self.assertEqual(cipherstore.CipherStore.load_config(), {})
+        with self.assertRaisesRegex(cipherstore.CipherstoreError, "does not exist"):
+            cipherstore.CipherStore.load_config(os.path.join(self.state, "nope.toml"))
+
+    def test_rejects(self):
+        for body, mode, msg in (
+            ('sockpath = "/x"', 0o600, "unknown key"),
+            ('socketpath = "rel"', 0o600, "absolute"),
+            ('mode = "bogus"', 0o600, "invalid mode"),
+            ("mode = 3", 0o600, "string"),
+            ('mode = "all"', 0o620, "writable"),
+        ):
+            with self.assertRaisesRegex(cipherstore.CipherstoreError, msg):
+                cipherstore.CipherStore.load_config(self.write(body, mode))
+
+    def test_main_options_override_config(self):
+        self.serve("control", lambda r: {"status": {"unlocked": False}})
+        path = self.write('mode = "all"\nsocketpath = "/nonexistent-cipherstore"\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cipherstore.CipherStore.main(
+                ["-config", path, "-mode", "solo", "-socketpath", self.state, "status"]
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), "locked\n")
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux-only fallback")

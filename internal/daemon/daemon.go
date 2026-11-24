@@ -29,16 +29,18 @@ import (
 	"github.com/jamespo/cipherstore/internal/store"
 )
 
-// SocketMode is the permission set applied to both sockets: owner only.
-const SocketMode = 0o700
-
 // Daemon serves the control and authed sockets.
 type Daemon struct {
 	layout paths.Layout
 	logger *log.Logger
+	// ownerUID is the only user allowed to unlock, lock or stop the daemon.
+	// It is the UID the daemon runs as; tests replace it to play another user.
+	ownerUID uint32
 
-	// lockFile holds the flock that enforces a single daemon per user.
-	lockFile *os.File
+	// lockFile and dataLockFile hold the flocks that allow only one daemon
+	// per socket directory and per database.
+	lockFile     *os.File
+	dataLockFile *os.File
 
 	control *ipc.Listener
 
@@ -71,25 +73,37 @@ func New(layout paths.Layout, logger *log.Logger) (*Daemon, error) {
 		return nil, err
 	}
 
-	lockFile, err := acquireLock(layout.LockFile)
+	lockFile, err := acquireLock(layout.LockFile, "using "+layout.StateDir)
 	if err != nil {
 		return nil, err
 	}
-
-	d := &Daemon{
-		layout:   layout,
-		logger:   logger,
-		lockFile: lockFile,
-		done:     make(chan struct{}),
-	}
-
-	// Only now that we hold the lock is it safe to clear a stale socket.
-	control, err := ipc.Listen(layout.ControlSocket, SocketMode)
+	dataLockFile, err := acquireLock(layout.DataLockFile, "using "+layout.DataDir)
 	if err != nil {
 		releaseLock(lockFile, layout.LockFile)
 		return nil, err
 	}
+
+	d := &Daemon{
+		layout:       layout,
+		logger:       logger,
+		ownerUID:     uint32(os.Getuid()),
+		lockFile:     lockFile,
+		dataLockFile: dataLockFile,
+		done:         make(chan struct{}),
+	}
+
+	// Only now that we hold the lock is it safe to clear a stale socket.
+	control, err := ipc.Listen(layout.ControlSocket, layout.Access)
+	if err != nil {
+		d.releaseLocks()
+		return nil, err
+	}
 	d.control = control
+
+	for _, dir := range paths.UnreachableAncestors(layout.StateDir, layout.Access) {
+		logger.Printf("warning: %s is not searchable by other users in %s mode, so they cannot reach the sockets",
+			dir, layout.Access.Mode)
+	}
 	return d, nil
 }
 
@@ -110,7 +124,7 @@ func (d *Daemon) Run() error {
 		}
 	}()
 
-	d.logger.Printf("listening on %s (locked)", d.control.Path())
+	d.logger.Printf("listening on %s (locked, access: %s)", d.control.Path(), d.layout.Access)
 	d.serve(d.control, d.handleControl)
 
 	<-d.done
@@ -155,6 +169,16 @@ func (d *Daemon) handleControl(conn net.Conn) {
 	}
 
 	var resp protocol.Response
+	if ownerOnly(req.Op) {
+		if err := d.checkOwner(conn); err != nil {
+			d.logger.Printf("control: refused %s: %v", req.Op, err)
+			resp := errResponse(err)
+			if err := protocol.WriteMessage(conn, &resp); err != nil {
+				d.logger.Printf("control: %v", err)
+			}
+			return
+		}
+	}
 	switch req.Op {
 	case protocol.OpUnlock:
 		resp = d.doUnlock(req)
@@ -176,6 +200,31 @@ func (d *Daemon) handleControl(conn net.Conn) {
 		d.logger.Print("stop requested")
 		d.stop()
 	}
+}
+
+// ownerOnly reports whether a control operation is reserved for the user the
+// daemon runs as. In group and all modes other users may read and write
+// secrets and ask for the status, but only the owner may change whether the
+// store is open or stop the daemon.
+func ownerOnly(op protocol.Op) bool {
+	switch op {
+	case protocol.OpUnlock, protocol.OpLock, protocol.OpStop:
+		return true
+	}
+	return false
+}
+
+// checkOwner requires the peer on conn to be the daemon's owner. It asks the
+// kernel, so it holds whatever the socket permissions are.
+func (d *Daemon) checkOwner(conn net.Conn) error {
+	uid, err := ipc.PeerUID(conn)
+	if err != nil {
+		return err
+	}
+	if uid != d.ownerUID {
+		return fmt.Errorf("permission denied: only the daemon's owner (uid %d) may unlock, lock or stop it", d.ownerUID)
+	}
+	return nil
 }
 
 // handleAuthed serves one request on the authed socket.
@@ -238,7 +287,7 @@ func (d *Daemon) doUnlock(req *protocol.Request) protocol.Response {
 		return errResponse(err)
 	}
 
-	authed, err := ipc.Listen(d.layout.AuthedSocket, SocketMode)
+	authed, err := ipc.Listen(d.layout.AuthedSocket, d.layout.Access)
 	if err != nil {
 		st.Close()
 		return errResponse(fmt.Errorf("create authed socket: %w", err))
@@ -419,6 +468,7 @@ func (d *Daemon) statusLocked() *protocol.Status {
 		LockAt:   d.lockAt,
 		DBPath:   d.layout.DBPath,
 		PID:      os.Getpid(),
+		Access:   d.layout.Access.String(),
 	}
 }
 
@@ -494,6 +544,11 @@ func (d *Daemon) closeAll() {
 	if err := d.control.Close(); err != nil {
 		d.logger.Printf("shutdown: close control socket: %v", err)
 	}
+	d.releaseLocks()
+}
+
+func (d *Daemon) releaseLocks() {
+	releaseLock(d.dataLockFile, d.layout.DataLockFile)
 	releaseLock(d.lockFile, d.layout.LockFile)
 }
 
@@ -537,8 +592,9 @@ func zero(b []byte) {
 }
 
 // acquireLock takes an exclusive, non-blocking flock on path to guarantee a
-// single daemon per user.
-func acquireLock(path string) (*os.File, error) {
+// single daemon per directory. what describes the directory for the error a
+// second daemon reports.
+func acquireLock(path, what string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file %s: %w", path, err)
@@ -546,7 +602,7 @@ func acquireLock(path string) (*os.File, error) {
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		f.Close()
 		if errors.Is(err, unix.EWOULDBLOCK) {
-			return nil, errors.New("another cipherstore daemon is already running")
+			return nil, fmt.Errorf("another cipherstore daemon is already running (%s)", what)
 		}
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}
