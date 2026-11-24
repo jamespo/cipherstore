@@ -106,6 +106,8 @@ type Status struct {
 	LockAt time.Time `json:"lock_at,omitzero"`
 	DBPath string    `json:"db_path"`
 	PID    int       `json:"pid"`
+	// Access describes who may use the daemon's sockets, e.g. "solo".
+	Access string `json:"access,omitempty"`
 }
 
 // Response is the daemon's reply. Error is non-empty exactly when the request

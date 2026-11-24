@@ -166,6 +166,97 @@ is discarded. Startup failures are still reported to the caller over a
 dedicated pipe, but for ongoing logs use systemd (or run `start` in the
 foreground).
 
+## Sharing a daemon with other users
+
+By default only the user who started the daemon can use it. Four global
+options, given **before** the command or in the [config file](#config-file),
+change that:
+
+| Option | Description |
+| --- | --- |
+| `-mode solo\|group\|all` | Who may use the daemon's sockets. Default `solo`. |
+| `-group name` | The group allowed in `group` mode. Defaults to your primary group. Only valid with `-mode group`. |
+| `-socketpath dir` | Directory the sockets (and the daemon's lock file) are created in. Default `~/.local/state/cipherstore`. |
+| `-dbpath dir` | Directory the database is created in. Default `~/.local/share/cipherstore`. |
+
+The mode sets the permissions on the socket directory and the sockets:
+
+| Mode | Socket directory | Sockets | Who can connect |
+| --- | --- | --- | --- |
+| `solo` | 0700 | 0700 | The daemon's user |
+| `group` | 0750, group set to `-group` | 0770, same group | The daemon's user and members of the group |
+| `all` | 0755 | 0777 | Every local user |
+
+The daemon also checks each connection's kernel credentials against the mode
+(the peer's UID, and in `group` mode its group list), so the file permissions
+are not the only thing deciding who is let in. The database directory stays
+0700 in every mode, because only the daemon opens it.
+
+For example, to share a store with the members of `ops`:
+
+```sh
+# as the owning user
+cipherstore -mode group -group ops -socketpath /srv/cipherstore start -d
+cipherstore -mode group -socketpath /srv/cipherstore unlock 8h
+
+# as any member of ops
+cipherstore -mode group -socketpath /srv/cipherstore get db-password
+```
+
+The other users must also give `-mode` (`group` or `all`) and the same
+`-socketpath`, normally by putting them in their config file. A client in the default `solo` mode only talks to a daemon run by
+its own user, and refuses a shared directory. In the shared modes the client
+accepts a daemon run by another user, but only if the socket directory, the
+socket and the listening process all belong to the same user and nobody else
+can write to the directory.
+
+Points to bear in mind:
+
+- **Only the owner can unlock, lock or stop the daemon.** Everyone else who
+  can connect may read every secret, add and delete entries, and run `status`.
+  There are no per-user permissions inside the store. The daemon enforces this
+  with the kernel's peer credentials, and the client refuses up front, so a
+  non-owner's `unlock` never prompts for (or sends) a password.
+- **The other users need to reach the directory.** Every directory above
+  `-socketpath` must be searchable by them. Home directories usually are not,
+  so pick a path outside `$HOME`, such as `/srv/cipherstore`. The daemon creates
+  any missing parent directories as 0755 in the shared modes, and logs a
+  warning at startup for any parent that other users cannot search.
+- **One daemon per socket directory and per database.** The daemon locks both
+  directories, so a second daemon cannot serve the same sockets or open the
+  same database, even with a different `-socketpath`.
+- **Group membership is read when a client connects.** Someone removed from the
+  group keeps access through any process that was started before the change.
+
+### Config file
+
+The global options can also be set in a TOML file, by default
+`~/.config/cipherstore.toml` (`$XDG_CONFIG_HOME/cipherstore.toml`). Choose
+another with `-config file`, or read none with `-config ""`. Options given on
+the command line override the file, and a missing default file is ignored.
+
+```toml
+# Every key is optional.
+mode = "group"                  # solo, group or all
+socketpath = "/srv/cipherstore" # where the sockets are
+group = "ops"                   # used by start, in group mode
+dbpath = "~/.local/share/cipherstore"   # used by start
+```
+
+`mode` and `socketpath` matter to every command, because the client needs
+them to find and trust the daemon. `group` and `dbpath` are only used by
+`start`. A `group` is ignored when the effective mode is not `group`, so
+`-mode solo` on the command line overrides a group-mode config.
+
+Paths must be absolute or start with `~/`. Because the file decides which
+daemon the client trusts, cipherstore refuses one that is not owned by you (or
+root) or that is writable by group or others, and it rejects unknown keys
+rather than silently ignoring a typo. A symlinked config file is fine, and its
+target is what gets checked.
+
+`start -d` passes `-config` on to the daemon, and a systemd unit reads the
+default file like any other command.
+
 ## Python client
 
 `contrib/python/cipherstore.py` is a single-file, standard-library-only Python
@@ -183,13 +274,21 @@ For details, see [contrib/python/README.md](contrib/python/README.md).
 
 | Path | Mode | Purpose |
 | --- | --- | --- |
-| `~/.local/state/cipherstore/` | 0700 | Runtime directory |
+| `~/.local/state/cipherstore/` | 0700 | Runtime directory (`-socketpath`) |
 | `~/.local/state/cipherstore/control` | 0700 | Control socket; exists while the daemon runs |
 | `~/.local/state/cipherstore/authed` | 0700 | Secret-operation socket; **exists only while unlocked** |
-| `~/.local/state/cipherstore/daemon.lock` | 0600 | `flock`ed to enforce a single daemon per user |
+| `~/.local/state/cipherstore/daemon.lock` | 0600 | `flock`ed so only one daemon serves this directory |
+| `~/.local/share/cipherstore/` | 0700 | Database directory (`-dbpath`) |
 | `~/.local/share/cipherstore/cipherstore.sqlite` | 0600 | The encrypted database |
+| `~/.local/share/cipherstore/daemon.lock` | 0600 | `flock`ed so only one daemon opens this database |
+| `~/.config/cipherstore.toml` | not group/other-writable | Optional [config file](#config-file) (`-config`) |
 
-`XDG_STATE_HOME` and `XDG_DATA_HOME` are honoured when set to absolute paths.
+The modes shown are for the default `solo` mode. See
+[Sharing a daemon with other users](#sharing-a-daemon-with-other-users) for
+the others.
+
+`XDG_STATE_HOME`, `XDG_DATA_HOME` and `XDG_CONFIG_HOME` are honoured when set
+to absolute paths.
 
 ## Security
 
@@ -213,6 +312,9 @@ practical points for a user are:
   database can destroy or roll it back; they cannot read it.
 - **No key rotation command.** Re-keying means `list`ing, `get`ting each secret,
   and rebuilding a fresh database under a new passphrase.
+- **`-mode group` and `-mode all` share every secret.** Every user who can
+  connect can read, add and delete them. Only the owner can unlock, lock or
+  stop the daemon.
 
 ## Testing
 

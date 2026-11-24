@@ -31,6 +31,16 @@ Type=simple
 # Run in the foreground: systemd supervises the process directly, so the daemon
 # must not fork. Do not add -d here.
 ExecStart=%h/.local/bin/cipherstore start
+#
+# To share the daemon with members of a group (see "Sharing a daemon with other
+# users" in the README), put the global options before `start`, and choose a
+# socket directory that the other users can reach -- usually not under $HOME:
+#     ExecStart=%h/.local/bin/cipherstore -mode group -group ops -socketpath /srv/cipherstore start
+# or leave ExecStart alone and set mode, group and socketpath in
+# ~/.config/cipherstore.toml, which the client commands then read too.
+# The parent directory (/srv here) must exist and be writable by you, or the
+# socket directory must already exist and be owned by you.
+# With ProtectSystem=strict, also add the socket directory to ReadWritePaths=.
 
 # No ExecStop: the daemon handles SIGTERM, closing the database and removing
 # both sockets. Running `cipherstore stop` here would fail noisily whenever the

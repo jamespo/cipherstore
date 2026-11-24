@@ -1,6 +1,9 @@
 package paths
 
 import (
+	"syscall"
+
+	"github.com/jamespo/cipherstore/internal/access"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,5 +199,189 @@ func TestCheckOwnedNonSymlinkAcceptsOwnedFile(t *testing.T) {
 	}
 	if !fi.Mode().IsRegular() {
 		t.Errorf("mode = %v, want a regular file", fi.Mode())
+	}
+}
+
+func TestNewUsesExplicitDirectories(t *testing.T) {
+	l, err := New("/srv/sockets", "/srv/db")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tests := []struct{ name, got, want string }{
+		{"StateDir", l.StateDir, "/srv/sockets"},
+		{"ControlSocket", l.ControlSocket, "/srv/sockets/control"},
+		{"AuthedSocket", l.AuthedSocket, "/srv/sockets/authed"},
+		{"LockFile", l.LockFile, "/srv/sockets/daemon.lock"},
+		{"DataDir", l.DataDir, "/srv/db"},
+		{"DBPath", l.DBPath, "/srv/db/cipherstore.sqlite"},
+		{"DataLockFile", l.DataLockFile, "/srv/db/daemon.lock"},
+	}
+	for _, tt := range tests {
+		if tt.got != tt.want {
+			t.Errorf("%s = %q, want %q", tt.name, tt.got, tt.want)
+		}
+	}
+}
+
+func TestNewMakesRelativePathsAbsolute(t *testing.T) {
+	l, err := New("rel/sock", "")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if !filepath.IsAbs(l.StateDir) || !strings.HasSuffix(l.StateDir, "rel/sock") {
+		t.Errorf("StateDir = %q, want an absolute path ending in rel/sock", l.StateDir)
+	}
+}
+
+func dirStat(t *testing.T, dir string) (os.FileMode, uint32) {
+	t.Helper()
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	return fi.Mode().Perm(), fi.Sys().(*syscall.Stat_t).Gid
+}
+
+func TestEnsureStateDirAppliesAccessMode(t *testing.T) {
+	gid := os.Getgid()
+	tests := []struct {
+		policy access.Policy
+		want   os.FileMode
+	}{
+		{access.Policy{}, 0o700},
+		{access.Policy{Mode: access.Group, GID: gid}, 0o750},
+		{access.Policy{Mode: access.All}, 0o755},
+	}
+	for _, tt := range tests {
+		t.Run(tt.policy.Mode.String(), func(t *testing.T) {
+			root := t.TempDir()
+			l := Layout{
+				StateDir: filepath.Join(root, "state"),
+				DataDir:  filepath.Join(root, "data"),
+				Access:   tt.policy,
+			}
+			if err := l.EnsureStateDir(); err != nil {
+				t.Fatalf("EnsureStateDir: %v", err)
+			}
+			if err := l.EnsureDataDir(); err != nil {
+				t.Fatalf("EnsureDataDir: %v", err)
+			}
+			perm, g := dirStat(t, l.StateDir)
+			if perm != tt.want {
+				t.Errorf("state dir mode = %#o, want %#o", perm, tt.want)
+			}
+			if tt.policy.Mode == access.Group && int(g) != gid {
+				t.Errorf("state dir gid = %d, want %d", g, gid)
+			}
+			// The database directory is owner-only in every mode.
+			if perm, _ := dirStat(t, l.DataDir); perm != 0o700 {
+				t.Errorf("data dir mode = %#o, want 0700", perm)
+			}
+		})
+	}
+}
+
+// Switching from a shared mode back to solo must close the directory again.
+func TestEnsureStateDirTightensWhenModeNarrows(t *testing.T) {
+	l := Layout{StateDir: filepath.Join(t.TempDir(), "state"), Access: access.Policy{Mode: access.All}}
+	if err := l.EnsureStateDir(); err != nil {
+		t.Fatalf("EnsureStateDir(all): %v", err)
+	}
+	l.Access = access.Policy{}
+	if err := l.EnsureStateDir(); err != nil {
+		t.Fatalf("EnsureStateDir(solo): %v", err)
+	}
+	if perm, _ := dirStat(t, l.StateDir); perm != 0o700 {
+		t.Errorf("mode = %#o, want 0700", perm)
+	}
+}
+
+// A symlink in place of the state directory must be refused without changing
+// the permissions of the directory it points to.
+func TestEnsureStateDirDoesNotChmodThroughSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "state")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	l := Layout{StateDir: link, Access: access.Policy{Mode: access.All}}
+	if err := l.EnsureStateDir(); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("EnsureStateDir = %v, want a symlink refusal", err)
+	}
+	if perm, _ := dirStat(t, target); perm != 0o700 {
+		t.Errorf("symlink target mode changed to %#o", perm)
+	}
+}
+
+func TestEnsureStateDirCreatesSearchableParentsDespiteUmask(t *testing.T) {
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+
+	root := t.TempDir()
+	l := Layout{StateDir: filepath.Join(root, "a", "b", "state"), Access: access.Policy{Mode: access.All}}
+	if err := l.EnsureStateDir(); err != nil {
+		t.Fatalf("EnsureStateDir: %v", err)
+	}
+	for _, d := range []string{filepath.Join(root, "a"), filepath.Join(root, "a", "b")} {
+		if perm, _ := dirStat(t, d); perm != 0o755 {
+			t.Errorf("%s mode = %#o, want 0755", d, perm)
+		}
+	}
+}
+
+func TestCheckDirRejectsWritableByOthers(t *testing.T) {
+	dir := t.TempDir()
+	for _, mode := range []os.FileMode{0o775, 0o757, 0o777} {
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckDir(dir, access.Policy{Mode: access.All}); err == nil {
+			t.Errorf("CheckDir(all) accepted mode %#o", mode)
+		}
+	}
+}
+
+func TestCheckDirRejectsWrongGroup(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	p := access.Policy{Mode: access.Group, GID: os.Getgid() + 1}
+	if err := CheckDir(dir, p); err == nil {
+		t.Error("CheckDir accepted a directory belonging to another group")
+	}
+}
+
+func TestUnreachableAncestors(t *testing.T) {
+	root := t.TempDir()
+	closed := filepath.Join(root, "closed")
+	state := filepath.Join(closed, "state")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := UnreachableAncestors(state, access.Policy{}); got != nil {
+		t.Errorf("solo mode reported %v, want nil", got)
+	}
+	got := UnreachableAncestors(state, access.Policy{Mode: access.All})
+	if len(got) == 0 || got[0] != closed {
+		t.Errorf("UnreachableAncestors = %v, want %s first", got, closed)
+	}
+
+	if err := os.Chmod(closed, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range UnreachableAncestors(state, access.Policy{Mode: access.All}) {
+		if d == closed || d == root {
+			t.Errorf("%s reported unreachable after opening it", d)
+		}
 	}
 }

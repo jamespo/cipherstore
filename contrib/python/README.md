@@ -39,6 +39,26 @@ To use a state directory other than `$XDG_STATE_HOME/cipherstore` (by default
 c = CipherStore("/path/to/state/cipherstore")
 ```
 
+To use a daemon that another user runs with `-mode group` or `-mode all`, pass
+`shared=True` along with its `-socketpath`:
+
+```python
+c = CipherStore("/srv/cipherstore", shared=True)
+```
+
+The command-line form takes the same global options as the Go client, before
+the command: `python3 cipherstore.py -mode group -socketpath /srv/cipherstore get TOKENID`.
+
+To use the Go CLI's config file (`~/.config/cipherstore.toml`, see the main
+README) instead, call `CipherStore.from_config()`, or `from_config(path)` for a
+different file. Only `mode` and `socketpath` are used. The file is checked the
+same way as in Go: it must be owned by you or root, must not be writable by
+group or others, and must not contain unknown keys. The command-line
+`cipherstore.py` reads it by default, takes `-config FILE` (or `-config ""` for
+none), and its `-mode`/`-socketpath` override the file. Reading a config file
+needs Python 3.11+ (`tomllib`). On older versions the client works as before
+but fails if a config file is present.
+
 ### Exceptions
 
 All exceptions derive from `CipherstoreError`. Each one is also an attribute
@@ -74,6 +94,10 @@ The client makes the same checks as the Go client before it sends anything:
   (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS). It refuses the
   connection unless that UID is its own. This check is the authoritative one,
   because the path checks above can race.
+
+With `shared=True` "the current user" becomes "the owner of the state
+directory" in each check above. The directory may then be group- or
+world-readable, but it must still not be writable by anyone except its owner.
 
 If the socket path is longer than `sun_path` allows, the client connects
 through `/proc/self/fd/N/<socket>` on an `O_NOFOLLOW` directory handle on

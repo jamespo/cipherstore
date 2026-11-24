@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/jamespo/cipherstore/internal/access"
 	"github.com/jamespo/cipherstore/internal/ipc"
 )
 
@@ -125,7 +127,7 @@ func TestAuthedCommandsReportLockedWhenDaemonPresent(t *testing.T) {
 	e, _, _ := newEnv(t, "")
 
 	// Stand in for a running daemon by creating a control socket.
-	l, err := ipc.Listen(e.layout.ControlSocket, 0o700)
+	l, err := ipc.Listen(e.layout.ControlSocket, access.Policy{})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -342,5 +344,88 @@ func TestWriteOwnerOnlyFileRefusesSymlink(t *testing.T) {
 
 	if err := writeOwnerOnlyFile(link, []byte("data")); err == nil {
 		t.Fatal("writeOwnerOnlyFile on a symlink succeeded, want an error")
+	}
+}
+
+func TestParseGlobalStopsAtCommand(t *testing.T) {
+	args := []string{"-mode", "group", "-socketpath", "/srv/cs", "get", "-n", "tok"}
+	o, rest, err := parseGlobal(args, io.Discard)
+	if err != nil {
+		t.Fatalf("parseGlobal: %v", err)
+	}
+	if o.mode != "group" || o.socketPath != "/srv/cs" {
+		t.Errorf("options = %+v", o)
+	}
+	if want := []string{"get", "-n", "tok"}; strings.Join(rest, " ") != strings.Join(want, " ") {
+		t.Errorf("rest = %q, want %q", rest, want)
+	}
+}
+
+func TestLayoutForAppliesOptions(t *testing.T) {
+	l, err := layoutFor(globalOptions{mode: "all", socketPath: "/srv/cs", dbPath: "/srv/db"})
+	if err != nil {
+		t.Fatalf("layoutFor: %v", err)
+	}
+	if l.Access.Mode != access.All {
+		t.Errorf("mode = %v, want all", l.Access.Mode)
+	}
+	if l.ControlSocket != "/srv/cs/control" || l.DBPath != "/srv/db/cipherstore.sqlite" {
+		t.Errorf("layout = %+v", l)
+	}
+
+	l, err = layoutFor(globalOptions{mode: "group"})
+	if err != nil {
+		t.Fatalf("layoutFor(group): %v", err)
+	}
+	if l.Access.GID != os.Getgid() {
+		t.Errorf("default group gid = %d, want primary gid %d", l.Access.GID, os.Getgid())
+	}
+}
+
+func TestLayoutForRejectsBadOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		o    globalOptions
+	}{
+		{"unknown mode", globalOptions{mode: "public"}},
+		{"group without group mode", globalOptions{mode: "solo", group: "wheel"}},
+		{"group with all mode", globalOptions{mode: "all", group: "wheel"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := layoutFor(tt.o)
+			if code := exitCodeFor(err); err == nil || code != exitUsage {
+				t.Errorf("layoutFor = %v (exit %d), want a usage error", err, code)
+			}
+		})
+	}
+	if _, err := layoutFor(globalOptions{mode: "group", group: "no-such-group-cipherstore-test"}); err == nil {
+		t.Error("layoutFor accepted an unknown group")
+	}
+}
+
+func TestRunRejectsUnknownGlobalFlag(t *testing.T) {
+	if code := Run([]string{"-nosuchflag", "list"}); code != exitUsage {
+		t.Errorf("Run = %d, want %d", code, exitUsage)
+	}
+}
+
+// A client in solo mode must not talk to a daemon whose directory is shared,
+// and should point the user at -mode.
+func TestSoloClientRefusesSharedDaemonDir(t *testing.T) {
+	e, _, _ := newEnv(t, "")
+	shared := access.Policy{Mode: access.All}
+	if err := os.Chmod(e.layout.StateDir, shared.DirPerm()); err != nil {
+		t.Fatal(err)
+	}
+	l, err := ipc.Listen(e.layout.ControlSocket, shared)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	err = e.cmdStatus(nil)
+	if err == nil || !strings.Contains(err.Error(), "-mode") {
+		t.Errorf("status = %v, want a refusal mentioning -mode", err)
 	}
 }

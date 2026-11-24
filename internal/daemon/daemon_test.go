@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jamespo/cipherstore/internal/access"
 	"github.com/jamespo/cipherstore/internal/ipc"
 	"github.com/jamespo/cipherstore/internal/paths"
 	"github.com/jamespo/cipherstore/internal/protocol"
@@ -34,6 +35,16 @@ func listenRelative(path string) (net.Listener, error) {
 	return net.Listen("unix", name)
 }
 
+// testLayout resolves a layout for the given state and data directories.
+func testLayout(t *testing.T, stateDir, dataDir string) paths.Layout {
+	t.Helper()
+	layout, err := paths.New(stateDir, dataDir)
+	if err != nil {
+		t.Fatalf("paths.New: %v", err)
+	}
+	return layout
+}
+
 // harness is a running daemon plus the paths needed to talk to it.
 type harness struct {
 	t      *testing.T
@@ -48,18 +59,21 @@ func start(t *testing.T) *harness {
 	// t.TempDir is created 0700, which satisfies the daemon's checks. Keeping
 	// the path short also keeps it well inside the sun_path limit.
 	root := t.TempDir()
-	layout := paths.Layout{
-		StateDir:      filepath.Join(root, "state"),
-		ControlSocket: filepath.Join(root, "state", "control"),
-		AuthedSocket:  filepath.Join(root, "state", "authed"),
-		LockFile:      filepath.Join(root, "state", "daemon.lock"),
-		DataDir:       filepath.Join(root, "data"),
-		DBPath:        filepath.Join(root, "data", "cipherstore.sqlite"),
-	}
+	return startLayout(t, testLayout(t, filepath.Join(root, "state"), filepath.Join(root, "data")))
+}
+
+// startLayout brings up a daemon on the given layout and tears it down when
+// the test ends. Each configure function is applied to the daemon before it
+// starts serving.
+func startLayout(t *testing.T, layout paths.Layout, configure ...func(*Daemon)) *harness {
+	t.Helper()
 
 	d, err := New(layout, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("New: %v", err)
+	}
+	for _, fn := range configure {
+		fn(d)
 	}
 
 	stopped := make(chan struct{})
@@ -98,7 +112,7 @@ func (h *harness) authed(req *protocol.Request) *protocol.Response {
 
 func (h *harness) send(socket string, req *protocol.Request) *protocol.Response {
 	h.t.Helper()
-	conn, err := ipc.Dial(socket)
+	conn, err := ipc.Dial(socket, h.layout.Access)
 	if err != nil {
 		h.t.Fatalf("dial %s: %v", socket, err)
 	}
@@ -158,8 +172,8 @@ func TestAuthedSocketTracksLockState(t *testing.T) {
 	if fi.Mode()&os.ModeSocket == 0 {
 		t.Errorf("authed path is not a socket: mode %v", fi.Mode())
 	}
-	if perm := fi.Mode().Perm(); perm != SocketMode {
-		t.Errorf("authed socket mode = %#o, want %#o", perm, SocketMode)
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Errorf("authed socket mode = %#o, want %#o", perm, 0o700)
 	}
 
 	if resp := h.control(&protocol.Request{Op: protocol.OpLock}); resp.Error != "" {
@@ -395,6 +409,39 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+// Only the daemon's owner may unlock, lock or stop it. The test plays a
+// non-owner by giving the daemon a different owner UID.
+func TestLifecycleOpsAreOwnerOnly(t *testing.T) {
+	root := t.TempDir()
+	layout := testLayout(t, filepath.Join(root, "state"), filepath.Join(root, "data"))
+	h := startLayout(t, layout, func(d *Daemon) { d.ownerUID = uint32(os.Getuid()) + 1 })
+
+	for _, req := range []*protocol.Request{
+		{Op: protocol.OpUnlock, Password: testPassword},
+		{Op: protocol.OpLock},
+		{Op: protocol.OpLock, Duration: "10m"},
+		{Op: protocol.OpStop},
+	} {
+		resp := h.control(req)
+		if !strings.Contains(resp.Error, "permission denied") {
+			t.Errorf("%s by a non-owner: error %q, want permission denied", req.Op, resp.Error)
+		}
+	}
+
+	// The refused stop must not have stopped anything, and status stays open
+	// to everyone.
+	resp := h.control(&protocol.Request{Op: protocol.OpStatus})
+	if resp.Error != "" || resp.Status == nil {
+		t.Fatalf("status by a non-owner: %+v", resp)
+	}
+	if resp.Status.Unlocked {
+		t.Error("store unlocked by a non-owner")
+	}
+	if _, err := os.Lstat(layout.AuthedSocket); !os.IsNotExist(err) {
+		t.Errorf("authed socket exists after a refused unlock (err %v)", err)
+	}
+}
+
 func TestUnknownOperationRejected(t *testing.T) {
 	h := start(t)
 	h.unlock()
@@ -546,17 +593,76 @@ func TestSecondDaemonRefused(t *testing.T) {
 	}
 }
 
+// Two daemons with separate socket directories must still not share one
+// database, and the refused one must not disturb the first one's sockets.
+func TestSecondDaemonOnSameDatabaseRefused(t *testing.T) {
+	h := start(t)
+
+	other := testLayout(t, filepath.Join(t.TempDir(), "state"), h.layout.DataDir)
+	_, err := New(other, log.New(io.Discard, "", 0))
+	if err == nil {
+		t.Fatal("a second daemon on the same database started, want it refused")
+	}
+	if !strings.Contains(err.Error(), h.layout.DataDir) {
+		t.Errorf("error = %v, want it to name %s", err, h.layout.DataDir)
+	}
+	if _, err := os.Lstat(other.ControlSocket); !os.IsNotExist(err) {
+		t.Errorf("refused daemon left a control socket behind: %v", err)
+	}
+	if resp := h.control(&protocol.Request{Op: protocol.OpStatus}); resp.Status == nil {
+		t.Error("the original daemon stopped responding")
+	}
+}
+
+func TestSharedModesApplyToBothSockets(t *testing.T) {
+	gid := os.Getgid()
+	for _, p := range []access.Policy{{Mode: access.Group, GID: gid}, {Mode: access.All}} {
+		t.Run(p.Mode.String(), func(t *testing.T) {
+			root := t.TempDir()
+			layout := testLayout(t, filepath.Join(root, "state"), filepath.Join(root, "data"))
+			layout.Access = p
+			h := startLayout(t, layout)
+
+			if resp := h.control(&protocol.Request{Op: protocol.OpUnlock, Password: testPassword}); resp.Error != "" {
+				t.Fatalf("unlock: %s", resp.Error)
+			}
+			waitFor(t, layout.AuthedSocket, true)
+
+			checks := []struct {
+				path string
+				want os.FileMode
+			}{
+				{layout.StateDir, p.DirPerm()},
+				{layout.ControlSocket, p.SocketPerm()},
+				{layout.AuthedSocket, p.SocketPerm()},
+				{layout.DataDir, 0o700},
+			}
+			for _, c := range checks {
+				fi, err := os.Lstat(c.path)
+				if err != nil {
+					t.Fatalf("Lstat %s: %v", c.path, err)
+				}
+				if perm := fi.Mode().Perm(); perm != c.want {
+					t.Errorf("%s mode = %#o, want %#o", c.path, perm, c.want)
+				}
+			}
+
+			resp := h.control(&protocol.Request{Op: protocol.OpStatus})
+			if resp.Status == nil || resp.Status.Access != p.String() {
+				t.Errorf("status access = %+v, want %q", resp.Status, p.String())
+			}
+			add := h.authed(&protocol.Request{Op: protocol.OpAdd, TokenID: "t", Secret: "s"})
+			if add.Error != "" {
+				t.Errorf("add: %s", add.Error)
+			}
+		})
+	}
+}
+
 // Shutdown must not leave sockets behind for a later run to trip over.
 func TestShutdownRemovesSockets(t *testing.T) {
 	root := t.TempDir()
-	layout := paths.Layout{
-		StateDir:      filepath.Join(root, "state"),
-		ControlSocket: filepath.Join(root, "state", "control"),
-		AuthedSocket:  filepath.Join(root, "state", "authed"),
-		LockFile:      filepath.Join(root, "state", "daemon.lock"),
-		DataDir:       filepath.Join(root, "data"),
-		DBPath:        filepath.Join(root, "data", "cipherstore.sqlite"),
-	}
+	layout := testLayout(t, filepath.Join(root, "state"), filepath.Join(root, "data"))
 
 	d, err := New(layout, log.New(io.Discard, "", 0))
 	if err != nil {
@@ -569,7 +675,7 @@ func TestShutdownRemovesSockets(t *testing.T) {
 	}()
 	waitFor(t, layout.ControlSocket, true)
 
-	conn, err := ipc.Dial(layout.ControlSocket)
+	conn, err := ipc.Dial(layout.ControlSocket, access.Policy{})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -605,14 +711,7 @@ func TestShutdownRemovesSockets(t *testing.T) {
 func TestStartOverStaleSocketAndLock(t *testing.T) {
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
-	layout := paths.Layout{
-		StateDir:      stateDir,
-		ControlSocket: filepath.Join(stateDir, "control"),
-		AuthedSocket:  filepath.Join(stateDir, "authed"),
-		LockFile:      filepath.Join(stateDir, "daemon.lock"),
-		DataDir:       filepath.Join(root, "data"),
-		DBPath:        filepath.Join(root, "data", "cipherstore.sqlite"),
-	}
+	layout := testLayout(t, stateDir, filepath.Join(root, "data"))
 	if err := layout.EnsureStateDir(); err != nil {
 		t.Fatalf("EnsureStateDir: %v", err)
 	}

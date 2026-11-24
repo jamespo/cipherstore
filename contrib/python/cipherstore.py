@@ -91,7 +91,15 @@ class CipherStore:
     """A cipherstore client bound to a particular state directory.
 
     ``state_dir`` defaults to ``$XDG_STATE_HOME/cipherstore`` (falling back to
-    ``~/.local/state/cipherstore``), matching the daemon.
+    ``~/.local/state/cipherstore``), matching the daemon. It is the daemon's
+    ``-socketpath``.
+
+    ``shared`` is the equivalent of the Go client's ``-mode group`` or
+    ``-mode all``: it allows talking to a daemon run by another user. The
+    client then trusts the owner of ``state_dir``, and requires the socket and
+    the listening process to belong to that same user and the directory not to
+    be writable by anyone else. When False (the default, ``-mode solo``),
+    everything must belong to the current user.
     """
 
     # Exceptions, exposed here so callers need only import CipherStore.
@@ -111,6 +119,7 @@ class CipherStore:
         lock_at: Optional[datetime]
         db_path: str
         pid: int
+        access: str = ""
 
     # Must match internal/protocol/protocol.go.
     MAX_MESSAGE_BYTES = 1 << 20
@@ -122,8 +131,9 @@ class CipherStore:
     _MISSING = object()
     _FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 
-    def __init__(self, state_dir: Optional[str] = None) -> None:
+    def __init__(self, state_dir: Optional[str] = None, shared: bool = False) -> None:
         self.state_dir = state_dir or self.default_state_dir()
+        self.shared = shared
         self.control_socket = os.path.join(self.state_dir, "control")
         self.authed_socket = os.path.join(self.state_dir, "authed")
 
@@ -182,6 +192,7 @@ class CipherStore:
             lock_at=self._parse_time(s.get("lock_at")),
             db_path=s.get("db_path", ""),
             pid=int(s.get("pid", 0)),
+            access=s.get("access", ""),
         )
 
     def is_unlocked(self) -> bool:
@@ -233,7 +244,7 @@ class CipherStore:
 
     def _dial(self, path: str, absent: CipherstoreError) -> socket.socket:
         """Connect to a cipherstore socket after validating it, as ipc.Dial does."""
-        self._check_dir(os.path.dirname(path))
+        owner = self._check_dir(os.path.dirname(path))
 
         try:
             st = os.lstat(path)
@@ -246,7 +257,7 @@ class CipherStore:
             raise CipherstoreError("%s is a symlink; refusing to connect" % path)
         if not stat.S_ISSOCK(st.st_mode):
             raise CipherstoreError("%s is not a socket; refusing to connect" % path)
-        self._check_owner(path, st)
+        self._check_owner(path, st, owner)
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -254,9 +265,9 @@ class CipherStore:
             self._connect(sock, path)
             # Authoritative check: ask the kernel who is on the other end.
             uid = self._peer_uid(sock)
-            if uid != os.getuid():
+            if uid != owner:
                 raise CipherstoreError(
-                    "%s: peer uid %d is not %d" % (path, uid, os.getuid())
+                    "%s: peer uid %d is not %d" % (path, uid, owner)
                 )
         except FileNotFoundError:
             sock.close()
@@ -330,16 +341,16 @@ class CipherStore:
     # -- validation helpers ------------------------------------------------
 
     @staticmethod
-    def _check_owner(path: str, st: os.stat_result) -> None:
-        uid = os.getuid()
+    def _check_owner(path: str, st: os.stat_result, uid: int) -> None:
         if st.st_uid != uid:
             raise CipherstoreError(
                 "%s is owned by uid %d, not %d; refusing to use it"
                 % (path, st.st_uid, uid)
             )
 
-    @classmethod
-    def _check_dir(cls, path: str) -> None:
+    def _check_dir(self, path: str) -> int:
+        """Validate the state directory and return the UID the daemon must
+        run as."""
         try:
             st = os.lstat(path)
         except OSError as e:
@@ -348,13 +359,23 @@ class CipherStore:
             raise CipherstoreError("%s is a symlink; refusing to use it" % path)
         if not stat.S_ISDIR(st.st_mode):
             raise CipherstoreError("%s is not a directory" % path)
-        cls._check_owner(path, st)
         perm = stat.S_IMODE(st.st_mode)
+        if self.shared:
+            # Anyone who can write to the directory could replace the sockets.
+            if perm & 0o022:
+                raise CipherstoreError(
+                    "%s has permissions %#o; must not be writable by group or others"
+                    % (path, perm)
+                )
+            return st.st_uid
+        self._check_owner(path, st, os.getuid())
         if perm & 0o077:
             raise CipherstoreError(
                 "%s has permissions %#o; must not be accessible to group or others"
+                " (to use a daemon shared by another user, pass shared=True)"
                 % (path, perm)
             )
+        return os.getuid()
 
     @staticmethod
     def _require_token(token_id: str) -> None:
@@ -376,6 +397,86 @@ class CipherStore:
         except ValueError:
             return None
 
+    # -- config file -------------------------------------------------------
+
+    _CONFIG_KEYS = ("mode", "group", "socketpath", "dbpath")
+
+    @classmethod
+    def from_config(cls, path: Optional[str] = None) -> "CipherStore":
+        """Build a client from the Go CLI's config file.
+
+        ``path`` defaults to ``$XDG_CONFIG_HOME/cipherstore.toml`` (normally
+        ``~/.config/cipherstore.toml``), and a missing default file just means
+        the defaults. ``mode`` and ``socketpath`` are used; ``group`` and
+        ``dbpath`` only concern the daemon and are ignored. Reading a config
+        file needs Python 3.11+ (``tomllib``).
+        """
+        cfg = cls.load_config(path)
+        return cls(cfg.get("socketpath"), shared=cfg.get("mode", "solo") != "solo")
+
+    @staticmethod
+    def default_config_path() -> str:
+        v = os.environ.get("XDG_CONFIG_HOME", "")
+        base = v if os.path.isabs(v) else os.path.join(os.path.expanduser("~"), ".config")
+        return os.path.join(base, "cipherstore.toml")
+
+    @classmethod
+    def load_config(cls, path: Optional[str] = None) -> Dict[str, str]:
+        """Read and validate a config file, with the same rules as the Go CLI."""
+        explicit = path is not None
+        path = path if explicit else cls.default_config_path()
+        try:
+            f = open(path, "rb")
+        except FileNotFoundError:
+            if explicit:
+                raise CipherstoreError("config %s does not exist" % path)
+            return {}
+        with f:
+            # Checked on the open descriptor, so a symlink is judged by the
+            # file it leads to. The file picks which daemon to trust, so only
+            # its owner (or root) may be able to change it.
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise CipherstoreError("config %s is not a regular file" % path)
+            if st.st_uid not in (os.getuid(), 0):
+                raise CipherstoreError(
+                    "config %s is owned by uid %d; it must be owned by you or root" % (path, st.st_uid)
+                )
+            if stat.S_IMODE(st.st_mode) & 0o022:
+                raise CipherstoreError(
+                    "config %s has permissions %#o; must not be writable by group or others"
+                    % (path, stat.S_IMODE(st.st_mode))
+                )
+            data = f.read(64 << 10)
+        try:
+            import tomllib
+        except ImportError:
+            raise CipherstoreError("reading config %s needs Python 3.11 or later" % path)
+        try:
+            cfg = tomllib.loads(data.decode("utf-8"))
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+            raise CipherstoreError("config %s: %s" % (path, e))
+
+        unknown = sorted(set(cfg) - set(cls._CONFIG_KEYS))
+        if unknown:
+            raise CipherstoreError(
+                "config %s: unknown key(s) %s (want %s)" % (path, ", ".join(unknown), ", ".join(cls._CONFIG_KEYS))
+            )
+        for k, v in cfg.items():
+            if not isinstance(v, str):
+                raise CipherstoreError("config %s: %s must be a string" % (path, k))
+        if cfg.get("mode", "solo") not in ("solo", "group", "all"):
+            raise CipherstoreError("config %s: invalid mode %r" % (path, cfg["mode"]))
+        for k in ("socketpath", "dbpath"):
+            v = cfg.get(k, "")
+            if v == "~" or v.startswith("~/"):
+                cfg[k] = os.path.expanduser(v)
+            elif v and not os.path.isabs(v):
+                raise CipherstoreError("config %s: %s %r must be an absolute path or start with ~/" % (path, k, v))
+            elif v:
+                cfg[k] = os.path.normpath(v)
+        return cfg
+
     @staticmethod
     def default_state_dir() -> str:
         # Relative XDG values are invalid per the spec and ignored, as in Go.
@@ -385,15 +486,27 @@ class CipherStore:
 
     # -- minimal CLI -------------------------------------------------------
 
-    _USAGE = """usage: cipherstore.py get TOKENID
-       cipherstore.py list
-       cipherstore.py status"""
+    _USAGE = """usage: cipherstore.py [OPTIONS] get TOKENID
+       cipherstore.py [OPTIONS] list
+       cipherstore.py [OPTIONS] status
+options: -mode solo|group|all  -socketpath DIR  -config FILE (\"\" for none)"""
 
     @classmethod
     def main(cls, argv: Optional[List[str]] = None) -> int:
-        args = sys.argv[1:] if argv is None else argv
+        args = list(sys.argv[1:] if argv is None else argv)
+        opts: Dict[str, str] = {}
+        # Global options before the command, as in the Go CLI. They override
+        # the config file.
+        while len(args) >= 2 and args[0].lstrip("-") in ("mode", "socketpath", "config"):
+            opts[args[0].lstrip("-")] = args[1]
+            args = args[2:]
+        if opts.get("mode", "solo") not in ("solo", "group", "all"):
+            print(cls._USAGE, file=sys.stderr)
+            return 2
         try:
-            c = cls()
+            cfg = {} if opts.get("config") == "" else cls.load_config(opts.get("config"))
+            mode = opts.get("mode", cfg.get("mode", "solo"))
+            c = cls(opts.get("socketpath", cfg.get("socketpath")), shared=mode != "solo")
             if len(args) == 2 and args[0] == "get":
                 sys.stdout.write(c.get(args[1]) + "\n")
             elif args == ["list"]:

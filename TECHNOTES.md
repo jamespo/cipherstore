@@ -15,6 +15,8 @@ internal/store/            SQLCipher persistence
 internal/ipc/              Hardened UNIX socket setup
 internal/protocol/         Request/response types and framing
 internal/paths/            XDG path resolution and permission invariants
+internal/access/           The -mode/-group access policy
+internal/cli/config.go     The -config TOML file
 ```
 
 ### The two sockets
@@ -110,12 +112,17 @@ and at mistakes.
 
 ### Path and socket hardening
 
-**Directory invariants.** Every directory cipherstore uses is created 0700 and
-re-validated on each use: it must be a real directory (not a symlink), owned by
-the current UID, with no group or world permission bits. An existing directory
-loosened by a stray umask is tightened. This is the foundation everything else
-rests on — an attacker who cannot write into the parent directory cannot swap a
-socket or the database for something of their own.
+**Directory invariants.** Every directory cipherstore uses is re-validated on
+each use: it must be a real directory (not a symlink), owned by the current UID,
+and have no permission bits beyond those the access mode allows (0700 in solo
+mode; see [Access modes](#access-modes)). No mode ever allows anyone but the
+owner to write. An existing directory loosened by a stray umask is tightened.
+The ownership and mode are changed through a descriptor opened with
+`O_NOFOLLOW|O_DIRECTORY`, so a symlink planted in place of the directory is
+refused instead of having its target's permissions changed. This is the
+foundation everything else rests on — an attacker who cannot write into the
+parent directory cannot swap a socket or the database for something of their
+own.
 
 **Symlink attacks.** Socket paths are `Lstat`ed, not `Stat`ed: a symlink where a
 socket is expected is refused rather than followed. This matters most for
@@ -129,11 +136,13 @@ current user — anything else is refused rather than silently deleted, so a
 misconfigured path cannot destroy an unrelated file.
 
 **Peer credentials.** Path checks are inherently racy (time-of-check to
-time-of-use), so they are backed by the authoritative check: both ends read
-`SO_PEERCRED` and require the other end's UID to match their own. The daemon
-closes and skips connections from other users; the client refuses to send
-anything to a socket served by another user. An attacker would have to interpose
-*as the same UID*, which already has full access.
+time-of-use), so they are backed by the authoritative check: both ends read the
+peer's credentials from the kernel (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on
+Darwin). In solo mode both ends require the other end's UID to match their own.
+The daemon closes and skips connections from other users; the client refuses to
+send anything to a socket served by another user. An attacker would have to
+interpose *as the same UID*, which already has full access. The shared modes
+relax this as described below.
 
 **Socket creation race.** `net.Listen` creates the socket with `0777` masked by
 umask, which could briefly leave it group- or world-accessible. cipherstore
@@ -142,10 +151,98 @@ the socket is never more permissive than intended, even momentarily. umask and
 the working directory are both process-global, so both swaps are serialised
 under one mutex.
 
-**Single instance.** The daemon holds an exclusive `flock` on
-`daemon.lock`, so a second daemon is refused rather than stealing the first
-one's sockets. The lock file is unlinked before being unlocked, so a daemon
-starting concurrently cannot acquire a lock on a file that is about to vanish.
+**Single instance.** The daemon holds an exclusive `flock` on a `daemon.lock`
+in both the socket directory and the database directory, so a second daemon is
+refused rather than stealing the first one's sockets or opening the same
+database, even when `-socketpath` and `-dbpath` are combined differently. The
+lock files are unlinked before being unlocked, so a daemon starting
+concurrently cannot acquire a lock on a file that is about to vanish.
+
+### Access modes
+
+`-mode` selects one of three policies (package `internal/access`):
+
+| Mode | Socket dir | Sockets | Daemon accepts a peer whose… |
+| --- | --- | --- | --- |
+| `solo` | 0700 | 0700 | UID is the daemon's |
+| `group` | 0750, gid G | 0770, gid G | UID is the daemon's, or group list contains G |
+| `all` | 0755 | 0777 | (anyone) |
+
+The file permissions are the primary gate: connecting to a unix socket needs
+search permission on its directory and write permission on the socket. The
+daemon then repeats the decision with the kernel's peer credentials. In group
+mode it reads the peer's full group list with `SO_PEERGROUPS` (Linux 4.13+) or
+from the `xucred` (Darwin, up to 16 groups), plus the primary GID. These are the
+credentials the client had when it connected.
+
+The socket's group is set with `lchown` while it is still 0700 from the clamped
+umask, and only then is the mode opened up, so it is never group-accessible
+with the wrong group.
+
+The database directory is always 0700: only the daemon opens it.
+
+**Owner-only operations.** `unlock`, `lock` and `stop` are refused unless the
+peer UID (from `SO_PEERCRED`/`LOCAL_PEERCRED`, as for the access check) is the
+daemon's own. `status` and every authed-socket operation stay open to whoever
+the mode lets in. The check is in `Daemon.handleControl` and runs before the
+request is acted on. A refused `unlock` never reaches `store.Open`.
+
+The client also enforces this, for two reasons. First, `unlock` checks the
+socket directory's owner before prompting, so a non-owner is not asked for a
+password that is going to be refused. Second, for all three commands the
+client checks the peer UID on the connection before writing the request, and
+refuses unless it is its own UID. So `unlock` never sends a passphrase to
+another user's daemon, even in the shared modes where `ipc.Dial` would accept
+one. That closes the passphrase-collecting attack described below for
+`unlock`: an attacker who owns a socket directory can still serve fake
+secrets, but cannot harvest a password.
+
+**Client side.** In solo mode the client keeps the strict checks: directory and
+socket owned by us, directory 0700, peer UID ours. A solo client given a shared
+directory refuses it and suggests `-mode`. In group and all modes the client
+accepts a daemon run by another user, and pins its trust to the directory's
+owner:
+
+- the directory must not be a symlink and must not be writable by group or
+  others, so only its owner can put a socket there;
+- the socket must be owned by that same user;
+- the peer UID reported by the kernel must be that same user.
+
+So in a shared mode the client trusts "whoever owns the socket directory". It
+is up to the user to point `-socketpath` at a directory they trust. A directory
+in a location where an attacker could have created it first (such as `/tmp`)
+is a bad choice, because the attacker would own it and could run a daemon that
+serves fake secrets or collects what clients `add`. (It cannot collect
+passphrases, because `unlock` only talks to the user's own daemon.) The owning
+user's daemon would refuse to start there, since it requires the directory to
+be its own.
+
+**Reachability.** Other users need search permission on every ancestor of the
+socket directory. Missing parents are created 0755 in the shared modes
+(explicitly chmodded, so a `UMask=0077` in the unit does not undo it), and at
+startup the daemon logs a warning for each ancestor that the allowed users
+cannot search. This only looks at mode bits, not ACLs, so it is a hint rather
+than a guarantee.
+
+### Config file
+
+`-config` (default `$XDG_CONFIG_HOME/cipherstore.toml`) supplies defaults for
+`mode`, `group`, `socketpath` and `dbpath`. Flags given on the command line win,
+which `parseGlobal` tracks with `flag.Visit`. The file is parsed with
+BurntSushi/toml, and `MetaData.Undecoded` turns an unknown key into an error.
+
+The file is security-relevant, because `mode` and `socketpath` decide which
+daemon a client trusts. So it is opened, then checked through the open
+descriptor: it must be a regular file owned by the user or root, with no group
+or other write bit. A symlink is followed on purpose (dotfile managers use
+them), and what is checked is the file actually read, not the link. A missing
+default file is not an error, but a missing `-config` file is. Paths must be
+absolute or start with `~/`, because a relative path would change meaning with
+the working directory. `-config ""` disables the file.
+
+A `group` from the file is dropped when the effective mode is not `group`,
+whereas `-group` given on the command line in another mode is a usage error.
+Without that, a group-mode config could not be overridden with `-mode solo`.
 
 ### Protecting the in-memory key
 
@@ -197,6 +294,11 @@ and silently key the database with a prefix of what was typed.
   database can destroy or roll it back; they cannot read it.
 - **No key rotation command.** Re-keying means `list`ing, `get`ting each secret,
   and rebuilding a fresh database under a new passphrase.
+- **No per-user access control over secrets in the shared modes.** In `group`
+  and `all` mode every user who can connect can read, add and delete every
+  secret. Only unlock, lock and stop are reserved to the owner. Group membership is checked against the credentials the
+  client had when it connected, so removing a user from the group does not
+  affect processes they started earlier.
 
 ## Testing
 

@@ -20,7 +20,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/jamespo/cipherstore/internal/access"
 	"github.com/jamespo/cipherstore/internal/daemon"
+	"github.com/jamespo/cipherstore/internal/ipc"
 	"github.com/jamespo/cipherstore/internal/paths"
 	"github.com/jamespo/cipherstore/internal/protocol"
 )
@@ -38,9 +40,104 @@ const (
 // testable and never reach for globals.
 type env struct {
 	layout paths.Layout
-	stdin  io.Reader
-	stdout io.Writer
-	stderr io.Writer
+	// globalArgs are the global options as given on the command line, which
+	// `start -d` passes on to the daemon it launches.
+	globalArgs []string
+	stdin      io.Reader
+	stdout     io.Writer
+	stderr     io.Writer
+}
+
+// globalOptions are the options accepted before the command name.
+type globalOptions struct {
+	mode       string
+	group      string
+	socketPath string
+	dbPath     string
+	version    bool
+
+	// config is the -config value, and configSet whether it was given.
+	config    string
+	configSet bool
+	// set holds the names of the options given on the command line, which
+	// take precedence over the config file.
+	set map[string]bool
+}
+
+// parseGlobal parses the options in front of the command name and returns the
+// remaining arguments, starting with the command.
+func parseGlobal(args []string, stderr io.Writer) (globalOptions, []string, error) {
+	var o globalOptions
+	fs := flag.NewFlagSet("cipherstore", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {}
+	fs.StringVar(&o.mode, "mode", "", "")
+	fs.StringVar(&o.group, "group", "", "")
+	fs.StringVar(&o.socketPath, "socketpath", "", "")
+	fs.StringVar(&o.dbPath, "dbpath", "", "")
+	fs.BoolVar(&o.version, "version", false, "")
+	fs.BoolVar(&o.version, "v", false, "")
+	fs.StringVar(&o.config, "config", "", "")
+	if err := fs.Parse(args); err != nil {
+		return o, nil, err
+	}
+	o.set = map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { o.set[f.Name] = true })
+	o.configSet = o.set["config"]
+	return o, fs.Args(), nil
+}
+
+// withConfig fills in the options not given on the command line from the
+// config file.
+func withConfig(o globalOptions) (globalOptions, error) {
+	path, explicit, err := configPath(o)
+	if err != nil || path == "" {
+		return o, err
+	}
+	cfg, err := loadConfig(path, explicit)
+	if err != nil {
+		return o, err
+	}
+	fill := func(name string, dst *string, v string) {
+		if !o.set[name] && v != "" {
+			*dst = v
+		}
+	}
+	fill("mode", &o.mode, cfg.Mode)
+	fill("socketpath", &o.socketPath, cfg.SocketPath)
+	fill("dbpath", &o.dbPath, cfg.DBPath)
+	// A group from the config only applies in group mode. Without this, a
+	// config written for group mode could not be overridden with -mode solo.
+	if !o.set["group"] && cfg.Group != "" && o.mode == "group" {
+		o.group = cfg.Group
+	}
+	return o, nil
+}
+
+// layoutFor resolves the paths and access policy the global options select.
+func layoutFor(o globalOptions) (paths.Layout, error) {
+	mode, err := access.ParseMode(o.mode)
+	if err != nil {
+		return paths.Layout{}, fmt.Errorf("%w: %v", errUsage, err)
+	}
+	if o.group != "" && mode != access.Group {
+		return paths.Layout{}, fmt.Errorf("%w: -group is only valid with -mode group", errUsage)
+	}
+	layout, err := paths.New(o.socketPath, o.dbPath)
+	if err != nil {
+		return paths.Layout{}, err
+	}
+	layout.Access.Mode = mode
+	if mode == access.Group {
+		// The default group is the user's primary group.
+		layout.Access.GID = os.Getgid()
+		if o.group != "" {
+			if layout.Access.GID, err = access.LookupGroup(o.group); err != nil {
+				return paths.Layout{}, err
+			}
+		}
+	}
+	return layout, nil
 }
 
 // version is overridden at build time with -ldflags "-X ...version=...".
@@ -49,19 +146,44 @@ var version = "dev"
 // Run dispatches argv (excluding the program name) and returns the process
 // exit code.
 func Run(args []string) int {
-	layout, err := paths.Default()
+	opts, cmdArgs, err := parseGlobal(args, os.Stderr)
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		usage(os.Stdout)
+		return exitOK
+	case err != nil:
+		fmt.Fprintln(os.Stderr)
+		usage(os.Stderr)
+		return exitUsage
+	case opts.version:
+		fmt.Fprintf(os.Stdout, "cipherstore %s\n", version)
+		return exitOK
+	}
+
+	opts, err = withConfig(opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cipherstore: %v\n", err)
 		return exitError
 	}
-	e := &env{layout: layout, stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr}
+	layout, err := layoutFor(opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cipherstore: %v\n", err)
+		return exitCodeFor(err)
+	}
+	e := &env{
+		layout:     layout,
+		globalArgs: args[:len(args)-len(cmdArgs)],
+		stdin:      os.Stdin,
+		stdout:     os.Stdout,
+		stderr:     os.Stderr,
+	}
 
-	if len(args) == 0 {
+	if len(cmdArgs) == 0 {
 		usage(e.stderr)
 		return exitUsage
 	}
 
-	cmd, rest := args[0], args[1:]
+	cmd, rest := cmdArgs[0], cmdArgs[1:]
 	var cmdErr error
 	switch cmd {
 	case "start":
@@ -86,10 +208,10 @@ func Run(args []string) int {
 		cmdErr = e.cmdExport(rest)
 	case "import":
 		cmdErr = e.cmdImport(rest)
-	case "version", "--version", "-v":
+	case "version":
 		fmt.Fprintf(e.stdout, "cipherstore %s\n", version)
 		return exitOK
-	case "help", "--help", "-h":
+	case "help":
 		usage(e.stdout)
 		return exitOK
 	default:
@@ -200,7 +322,8 @@ func (e *env) detach(quiet bool) error {
 	if err != nil {
 		return fmt.Errorf("locate own executable: %w", err)
 	}
-	args := []string{exe, "start"}
+	args := append([]string{exe}, e.globalArgs...)
+	args = append(args, "start")
 	if quiet {
 		args = append(args, "-quiet")
 	}
@@ -278,6 +401,9 @@ func (e *env) cmdUnlock(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := e.requireOwner("unlock"); err != nil {
+		return err
+	}
 
 	password, err := e.readPassword("Password: ")
 	if err != nil {
@@ -285,7 +411,7 @@ func (e *env) cmdUnlock(args []string) error {
 	}
 	defer zero(password)
 
-	resp, err := e.sendControl(&protocol.Request{
+	resp, err := e.sendOwnerControl(&protocol.Request{
 		Op:       protocol.OpUnlock,
 		Password: string(password),
 		Duration: duration,
@@ -310,8 +436,11 @@ func (e *env) cmdLock(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := e.requireOwner("lock"); err != nil {
+		return err
+	}
 
-	resp, err := e.sendControl(&protocol.Request{Op: protocol.OpLock, Duration: duration})
+	resp, err := e.sendOwnerControl(&protocol.Request{Op: protocol.OpLock, Duration: duration})
 	if err != nil {
 		return err
 	}
@@ -327,11 +456,27 @@ func (e *env) cmdStop(args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("%w: stop takes no arguments", errUsage)
 	}
-	if _, err := e.sendControl(&protocol.Request{Op: protocol.OpStop}); err != nil {
+	if err := e.requireOwner("stop"); err != nil {
+		return err
+	}
+	if _, err := e.sendOwnerControl(&protocol.Request{Op: protocol.OpStop}); err != nil {
 		return err
 	}
 	fmt.Fprintln(e.stdout, "daemon stopping")
 	return nil
+}
+
+// requireOwner refuses a lifecycle command up front when the daemon belongs
+// to another user, so `unlock` does not prompt for a password the daemon is
+// going to refuse. The daemon enforces the same rule itself; this is only an
+// earlier, clearer refusal. When the directory cannot be inspected the request
+// goes ahead and the daemon (or Dial) reports the problem.
+func (e *env) requireOwner(cmd string) error {
+	owner, err := ipc.SocketDirOwner(e.layout.ControlSocket)
+	if err != nil || owner == uint32(os.Getuid()) {
+		return nil
+	}
+	return fmt.Errorf("only the daemon's owner (uid %d) can %s it", owner, cmd)
 }
 
 func (e *env) cmdStatus(args []string) error {
@@ -353,6 +498,9 @@ func (e *env) cmdStatus(args []string) error {
 	fmt.Fprintf(e.stdout, "state:    %s\n", state)
 	fmt.Fprintf(e.stdout, "pid:      %d\n", st.PID)
 	fmt.Fprintf(e.stdout, "database: %s\n", st.DBPath)
+	if st.Access != "" {
+		fmt.Fprintf(e.stdout, "access:   %s\n", st.Access)
+	}
 	if !st.LockAt.IsZero() {
 		fmt.Fprintf(e.stdout, "locks at: %s (in %s)\n",
 			st.LockAt.Format(time.RFC1123), time.Until(st.LockAt).Round(time.Second))
@@ -628,7 +776,25 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `cipherstore - an encrypted store for logins and other secrets
 
 Usage:
-  cipherstore <command> [arguments]
+  cipherstore [global options] <command> [arguments]
+
+Global options (must come before the command):
+  -mode solo|group|all       Who may use the daemon's sockets (default solo):
+                               solo   only the user running the daemon
+                               group  that user and members of one group
+                               all    every local user
+                             Give the same -mode to the client commands, so
+                             they will talk to a daemon run by another user
+  -group name                Group allowed in group mode (default: your
+                             primary group)
+  -socketpath dir            Directory for the sockets (default
+                             $XDG_STATE_HOME/cipherstore)
+  -dbpath dir                Directory for the database (default
+                             $XDG_DATA_HOME/cipherstore); used by start
+  -config file               Config file giving defaults for the options
+                             above (default $XDG_CONFIG_HOME/cipherstore.toml,
+                             i.e. ~/.config/cipherstore.toml); -config ""
+                             reads none. Options on the command line win
 
 Daemon:
   start [-d] [-quiet]        Run the daemon (foreground by default; -d detaches)
@@ -637,6 +803,7 @@ Daemon:
                              optionally auto-locking after duration (e.g. 10m)
   lock [duration]            Lock now, or schedule a lock after duration
   status                     Report whether the store is unlocked
+  Only the daemon's owner may stop, unlock or lock it, in every mode.
 
 Secrets (require an unlocked store):
   get [-n] <tokenid>         Print the secret for tokenid
