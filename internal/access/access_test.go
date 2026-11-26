@@ -79,3 +79,20 @@ func TestLookupGroupRejectsUnknown(t *testing.T) {
 		t.Error("LookupGroup accepted an unknown group")
 	}
 }
+
+func TestPolicyString(t *testing.T) {
+	tests := []struct {
+		p    Policy
+		want string
+	}{
+		{Policy{}, "solo"},
+		{Policy{FullAccess: true}, "solo"},
+		{Policy{Mode: Group, GID: 10}, "group (gid 10), get only"},
+		{Policy{Mode: All, FullAccess: true}, "all, full access"},
+	}
+	for _, tt := range tests {
+		if got := tt.p.String(); got != tt.want {
+			t.Errorf("%+v.String() = %q, want %q", tt.p, got, tt.want)
+		}
+	}
+}

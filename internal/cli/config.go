@@ -20,11 +20,12 @@ import (
 // on the command line wins.
 //
 // mode and socketpath matter to every command, since the client must know
-// where the daemon is and whether it may be another user's. group and dbpath
-// are only used by `start`.
+// where the daemon is and whether it may be another user's. group, fullaccess
+// and dbpath are only used by `start`.
 type fileConfig struct {
 	Mode       string `toml:"mode"`
 	Group      string `toml:"group"`
+	FullAccess bool   `toml:"fullaccess"`
 	SocketPath string `toml:"socketpath"`
 	DBPath     string `toml:"dbpath"`
 }
@@ -81,7 +82,7 @@ func loadConfig(path string, explicit bool) (fileConfig, error) {
 			keys[i] = k.String()
 		}
 		sort.Strings(keys)
-		return cfg, fmt.Errorf("config %s: unknown key(s) %s (want mode, group, socketpath, dbpath)",
+		return cfg, fmt.Errorf("config %s: unknown key(s) %s (want mode, group, fullaccess, socketpath, dbpath)",
 			path, strings.Join(keys, ", "))
 	}
 

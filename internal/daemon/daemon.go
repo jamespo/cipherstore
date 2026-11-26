@@ -33,8 +33,10 @@ import (
 type Daemon struct {
 	layout paths.Layout
 	logger *log.Logger
-	// ownerUID is the only user allowed to unlock, lock or stop the daemon.
-	// It is the UID the daemon runs as; tests replace it to play another user.
+	// ownerUID is the only user allowed to unlock, lock or stop the daemon,
+	// and, unless the access policy grants full access, the only one allowed
+	// any secret operation besides get. It is the UID the daemon runs as;
+	// tests replace it to play another user.
 	ownerUID uint32
 
 	// lockFile and dataLockFile hold the flocks that allow only one daemon
@@ -170,7 +172,7 @@ func (d *Daemon) handleControl(conn net.Conn) {
 
 	var resp protocol.Response
 	if ownerOnly(req.Op) {
-		if err := d.checkOwner(conn); err != nil {
+		if err := d.checkOwner(conn, "unlock, lock or stop it", ""); err != nil {
 			d.logger.Printf("control: refused %s: %v", req.Op, err)
 			resp := errResponse(err)
 			if err := protocol.WriteMessage(conn, &resp); err != nil {
@@ -203,9 +205,8 @@ func (d *Daemon) handleControl(conn net.Conn) {
 }
 
 // ownerOnly reports whether a control operation is reserved for the user the
-// daemon runs as. In group and all modes other users may read and write
-// secrets and ask for the status, but only the owner may change whether the
-// store is open or stop the daemon.
+// daemon runs as. In group and all modes other users may ask for the status,
+// but only the owner may change whether the store is open or stop the daemon.
 func ownerOnly(op protocol.Op) bool {
 	switch op {
 	case protocol.OpUnlock, protocol.OpLock, protocol.OpStop:
@@ -214,15 +215,28 @@ func ownerOnly(op protocol.Op) bool {
 	return false
 }
 
+// ownerOnlySecretOp reports whether a secret operation is reserved for the
+// owner when the policy does not grant full access. Only get is not: other
+// users can fetch a secret whose name they know, but cannot enumerate, dump or
+// change the store.
+func ownerOnlySecretOp(op protocol.Op) bool {
+	return op != protocol.OpGet
+}
+
 // checkOwner requires the peer on conn to be the daemon's owner. It asks the
-// kernel, so it holds whatever the socket permissions are.
-func (d *Daemon) checkOwner(conn net.Conn) error {
+// kernel, so it holds whatever the socket permissions are. what says what
+// only the owner may do, and hint is appended to the refusal when non-empty.
+func (d *Daemon) checkOwner(conn net.Conn, what, hint string) error {
 	uid, err := ipc.PeerUID(conn)
 	if err != nil {
 		return err
 	}
 	if uid != d.ownerUID {
-		return fmt.Errorf("permission denied: only the daemon's owner (uid %d) may unlock, lock or stop it", d.ownerUID)
+		msg := fmt.Sprintf("permission denied: only the daemon's owner (uid %d) may %s", d.ownerUID, what)
+		if hint != "" {
+			msg += "; " + hint
+		}
+		return errors.New(msg)
 	}
 	return nil
 }
@@ -233,6 +247,18 @@ func (d *Daemon) handleAuthed(conn net.Conn) {
 	if err != nil {
 		d.logger.Printf("authed: %v", err)
 		return
+	}
+
+	if !d.layout.Access.FullAccess && ownerOnlySecretOp(req.Op) {
+		what := string(req.Op) + " secrets"
+		if err := d.checkOwner(conn, what, "the daemon must be started with -fullaccess to allow other users"); err != nil {
+			d.logger.Printf("authed: refused %s: %v", req.Op, err)
+			resp := errResponse(err)
+			if err := protocol.WriteMessage(conn, &resp); err != nil {
+				d.logger.Printf("authed: %v", err)
+			}
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), protocol.Timeout)

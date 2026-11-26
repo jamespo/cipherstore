@@ -168,7 +168,7 @@ foreground).
 
 ## Sharing a daemon with other users
 
-By default only the user who started the daemon can use it. Four global
+By default only the user who started the daemon can use it. Five global
 options, given **before** the command or in the [config file](#config-file),
 change that:
 
@@ -176,6 +176,7 @@ change that:
 | --- | --- |
 | `-mode solo\|group\|all` | Who may use the daemon's sockets. Default `solo`. |
 | `-group name` | The group allowed in `group` mode. Defaults to your primary group. Only valid with `-mode group`. |
+| `-fullaccess` | Let other users list, export, import, add and delete secrets. Without it they may only `get` and `status`. Only valid with `-mode group` or `-mode all`. |
 | `-socketpath dir` | Directory the sockets (and the daemon's lock file) are created in. Default `~/.local/state/cipherstore`. |
 | `-dbpath dir` | Directory the database is created in. Default `~/.local/share/cipherstore`. |
 
@@ -212,11 +213,15 @@ can write to the directory.
 
 Points to bear in mind:
 
-- **Only the owner can unlock, lock or stop the daemon.** Everyone else who
-  can connect may read every secret, add and delete entries, and run `status`.
-  There are no per-user permissions inside the store. The daemon enforces this
-  with the kernel's peer credentials, and the client refuses up front, so a
-  non-owner's `unlock` never prompts for (or sends) a password.
+- **Other users may only `get` and `status` by default.** They can fetch a
+  secret whose name they know, but cannot `list`, `export`, `import`, `add` or
+  `delete`. Start the daemon with `-fullaccess` to allow those too. There are
+  no per-user permissions inside the store: every user the mode lets in gets
+  the same rights.
+- **Only the owner can unlock, lock or stop the daemon**, with or without
+  `-fullaccess`. The daemon enforces this, and the restriction above, with the
+  kernel's peer credentials. The client also refuses lifecycle commands up
+  front, so a non-owner's `unlock` never prompts for (or sends) a password.
 - **The other users need to reach the directory.** Every directory above
   `-socketpath` must be searchable by them. Home directories usually are not,
   so pick a path outside `$HOME`, such as `/srv/cipherstore`. The daemon creates
@@ -240,13 +245,16 @@ the command line override the file, and a missing default file is ignored.
 mode = "group"                  # solo, group or all
 socketpath = "/srv/cipherstore" # where the sockets are
 group = "ops"                   # used by start, in group mode
+fullaccess = false              # used by start, in group or all mode
 dbpath = "~/.local/share/cipherstore"   # used by start
 ```
 
 `mode` and `socketpath` matter to every command, because the client needs
-them to find and trust the daemon. `group` and `dbpath` are only used by
-`start`. A `group` is ignored when the effective mode is not `group`, so
-`-mode solo` on the command line overrides a group-mode config.
+them to find and trust the daemon. `group`, `fullaccess` and `dbpath` are only
+used by `start`. A `group` is ignored when the effective mode is not `group`,
+and `fullaccess` when it is `solo`, so `-mode solo` on the command line
+overrides a shared-mode config. `-fullaccess=false` overrides
+`fullaccess = true`.
 
 Paths must be absolute or start with `~/`. Because the file decides which
 daemon the client trusts, cipherstore refuses one that is not owned by you (or
@@ -313,8 +321,9 @@ practical points for a user are:
 - **No key rotation command.** Re-keying means `list`ing, `get`ting each secret,
   and rebuilding a fresh database under a new passphrase.
 - **`-mode group` and `-mode all` share every secret.** Every user who can
-  connect can read, add and delete them. Only the owner can unlock, lock or
-  stop the daemon.
+  connect can `get` any secret whose name they know or can guess. With
+  `-fullaccess` they can also list, export, add and delete them. Only the
+  owner can unlock, lock or stop the daemon.
 
 ## Testing
 
