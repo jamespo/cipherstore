@@ -15,7 +15,7 @@ internal/store/            SQLCipher persistence
 internal/ipc/              Hardened UNIX socket setup
 internal/protocol/         Request/response types and framing
 internal/paths/            XDG path resolution and permission invariants
-internal/access/           The -mode/-group access policy
+internal/access/           The -mode/-group/-fullaccess access policy
 internal/cli/config.go     The -config TOML file
 ```
 
@@ -183,9 +183,16 @@ The database directory is always 0700: only the daemon opens it.
 
 **Owner-only operations.** `unlock`, `lock` and `stop` are refused unless the
 peer UID (from `SO_PEERCRED`/`LOCAL_PEERCRED`, as for the access check) is the
-daemon's own. `status` and every authed-socket operation stay open to whoever
-the mode lets in. The check is in `Daemon.handleControl` and runs before the
-request is acted on. A refused `unlock` never reaches `store.Open`.
+daemon's own. `status` stays open to whoever the mode lets in. The check is in
+`Daemon.handleControl` and runs before the request is acted on. A refused
+`unlock` never reaches `store.Open`.
+
+On the authed socket, `get` is open to whoever the mode lets in. The other
+operations (`list`, `export`, `import`, `add`, `delete`) get the same owner
+check in `Daemon.handleAuthed` unless the policy has `FullAccess`, set by
+`-fullaccess`. The client does not pre-check these: the daemon's refusal says
+to start it with `-fullaccess`, and nothing secret is sent in the request
+except on `add` and `import`, which go to a daemon the client already trusts.
 
 The client also enforces this, for two reasons. First, `unlock` checks the
 socket directory's owner before prompting, so a non-owner is not asked for a
@@ -227,7 +234,7 @@ than a guarantee.
 ### Config file
 
 `-config` (default `$XDG_CONFIG_HOME/cipherstore.toml`) supplies defaults for
-`mode`, `group`, `socketpath` and `dbpath`. Flags given on the command line win,
+`mode`, `group`, `fullaccess`, `socketpath` and `dbpath`. Flags given on the command line win,
 which `parseGlobal` tracks with `flag.Visit`. The file is parsed with
 BurntSushi/toml, and `MetaData.Undecoded` turns an unknown key into an error.
 

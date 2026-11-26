@@ -52,6 +52,7 @@ type env struct {
 type globalOptions struct {
 	mode       string
 	group      string
+	fullAccess bool
 	socketPath string
 	dbPath     string
 	version    bool
@@ -73,6 +74,7 @@ func parseGlobal(args []string, stderr io.Writer) (globalOptions, []string, erro
 	fs.Usage = func() {}
 	fs.StringVar(&o.mode, "mode", "", "")
 	fs.StringVar(&o.group, "group", "", "")
+	fs.BoolVar(&o.fullAccess, "fullaccess", false, "")
 	fs.StringVar(&o.socketPath, "socketpath", "", "")
 	fs.StringVar(&o.dbPath, "dbpath", "", "")
 	fs.BoolVar(&o.version, "version", false, "")
@@ -111,6 +113,10 @@ func withConfig(o globalOptions) (globalOptions, error) {
 	if !o.set["group"] && cfg.Group != "" && o.mode == "group" {
 		o.group = cfg.Group
 	}
+	// Likewise fullaccess only applies in the shared modes.
+	if !o.set["fullaccess"] && cfg.FullAccess && o.mode != "" && o.mode != "solo" {
+		o.fullAccess = true
+	}
 	return o, nil
 }
 
@@ -123,11 +129,15 @@ func layoutFor(o globalOptions) (paths.Layout, error) {
 	if o.group != "" && mode != access.Group {
 		return paths.Layout{}, fmt.Errorf("%w: -group is only valid with -mode group", errUsage)
 	}
+	if o.fullAccess && mode == access.Solo {
+		return paths.Layout{}, fmt.Errorf("%w: -fullaccess is only valid with -mode group or -mode all", errUsage)
+	}
 	layout, err := paths.New(o.socketPath, o.dbPath)
 	if err != nil {
 		return paths.Layout{}, err
 	}
 	layout.Access.Mode = mode
+	layout.Access.FullAccess = o.fullAccess
 	if mode == access.Group {
 		// The default group is the user's primary group.
 		layout.Access.GID = os.Getgid()
@@ -787,6 +797,9 @@ Global options (must come before the command):
                              they will talk to a daemon run by another user
   -group name                Group allowed in group mode (default: your
                              primary group)
+  -fullaccess                In group or all mode, let other users list,
+                             export, import, add and delete secrets; without
+                             it they may only get and status. Used by start
   -socketpath dir            Directory for the sockets (default
                              $XDG_STATE_HOME/cipherstore)
   -dbpath dir                Directory for the database (default
@@ -804,6 +817,7 @@ Daemon:
   lock [duration]            Lock now, or schedule a lock after duration
   status                     Report whether the store is unlocked
   Only the daemon's owner may stop, unlock or lock it, in every mode.
+  Other users may only get secrets unless the daemon has -fullaccess.
 
 Secrets (require an unlocked store):
   get [-n] <tokenid>         Print the secret for tokenid

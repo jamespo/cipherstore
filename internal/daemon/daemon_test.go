@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"log"
 	"net"
@@ -439,6 +440,93 @@ func TestLifecycleOpsAreOwnerOnly(t *testing.T) {
 	}
 	if _, err := os.Lstat(layout.AuthedSocket); !os.IsNotExist(err) {
 		t.Errorf("authed socket exists after a refused unlock (err %v)", err)
+	}
+}
+
+// startAsNonOwner brings up a daemon whose owner is some other user, so the
+// test plays a non-owner, with the store already unlocked and holding one
+// token. The unlock and add are made directly, since a non-owner cannot
+// unlock and the policy may forbid it adding.
+func startAsNonOwner(t *testing.T, fullAccess bool) *harness {
+	t.Helper()
+	root := t.TempDir()
+	layout := testLayout(t, filepath.Join(root, "state"), filepath.Join(root, "data"))
+	layout.Access.FullAccess = fullAccess
+	return startLayout(t, layout, func(d *Daemon) {
+		d.ownerUID = uint32(os.Getuid()) + 1
+		if resp := d.doUnlock(&protocol.Request{Password: testPassword}); resp.Error != "" {
+			t.Fatalf("unlock: %s", resp.Error)
+		}
+		if resp := d.doAdd(context.Background(), &protocol.Request{TokenID: "db", Secret: "s3cret"}); resp.Error != "" {
+			t.Fatalf("add: %s", resp.Error)
+		}
+	})
+}
+
+// Without full access, a non-owner may get secrets but do nothing else with
+// the store.
+func TestNonOwnerMayOnlyGetByDefault(t *testing.T) {
+	h := startAsNonOwner(t, false)
+
+	resp := h.authed(&protocol.Request{Op: protocol.OpGet, TokenID: "db"})
+	if resp.Error != "" || !resp.Found || resp.Secret != "s3cret" {
+		t.Fatalf("get by a non-owner: %+v", resp)
+	}
+
+	for _, req := range []*protocol.Request{
+		{Op: protocol.OpList},
+		{Op: protocol.OpExport},
+		{Op: protocol.OpImport, Entries: []protocol.Entry{{TokenID: "new", Secret: "x"}}},
+		{Op: protocol.OpAdd, TokenID: "db", Secret: "changed"},
+		{Op: protocol.OpDelete, TokenID: "db"},
+	} {
+		resp := h.authed(req)
+		if !strings.Contains(resp.Error, "permission denied") || !strings.Contains(resp.Error, "-fullaccess") {
+			t.Errorf("%s by a non-owner: error %q, want permission denied mentioning -fullaccess", req.Op, resp.Error)
+		}
+		if len(resp.Entries) != 0 {
+			t.Errorf("%s by a non-owner returned entries", req.Op)
+		}
+	}
+
+	// None of the refused writes took effect.
+	resp = h.authed(&protocol.Request{Op: protocol.OpGet, TokenID: "db"})
+	if !resp.Found || resp.Secret != "s3cret" {
+		t.Errorf("after refused writes: %+v, want db unchanged", resp)
+	}
+	if resp := h.authed(&protocol.Request{Op: protocol.OpGet, TokenID: "new"}); resp.Found {
+		t.Error("refused import added a token")
+	}
+
+	// Status stays open to everyone.
+	if resp := h.control(&protocol.Request{Op: protocol.OpStatus}); resp.Error != "" || !resp.Status.Unlocked {
+		t.Errorf("status by a non-owner: %+v", resp)
+	}
+}
+
+// With full access, a non-owner may use every secret operation.
+func TestNonOwnerFullAccess(t *testing.T) {
+	h := startAsNonOwner(t, true)
+
+	for _, req := range []*protocol.Request{
+		{Op: protocol.OpGet, TokenID: "db"},
+		{Op: protocol.OpList},
+		{Op: protocol.OpExport},
+		{Op: protocol.OpImport, Entries: []protocol.Entry{{TokenID: "new", Secret: "x"}}},
+		{Op: protocol.OpAdd, TokenID: "db", Secret: "changed"},
+		{Op: protocol.OpDelete, TokenID: "new"},
+	} {
+		if resp := h.authed(req); resp.Error != "" {
+			t.Errorf("%s by a non-owner with full access: %s", req.Op, resp.Error)
+		}
+	}
+	if resp := h.authed(&protocol.Request{Op: protocol.OpGet, TokenID: "db"}); resp.Secret != "changed" {
+		t.Errorf("db = %q after add, want %q", resp.Secret, "changed")
+	}
+
+	// Full access covers the secrets only, never the daemon's lifecycle.
+	if resp := h.control(&protocol.Request{Op: protocol.OpLock}); !strings.Contains(resp.Error, "permission denied") {
+		t.Errorf("lock by a non-owner with full access: error %q, want permission denied", resp.Error)
 	}
 }
 

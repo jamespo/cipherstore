@@ -369,6 +369,12 @@ func TestLayoutForAppliesOptions(t *testing.T) {
 	if l.Access.Mode != access.All {
 		t.Errorf("mode = %v, want all", l.Access.Mode)
 	}
+	if l.Access.FullAccess {
+		t.Error("full access granted without -fullaccess")
+	}
+	if l, _ := layoutFor(globalOptions{mode: "all", fullAccess: true}); !l.Access.FullAccess {
+		t.Error("-fullaccess did not grant full access")
+	}
 	if l.ControlSocket != "/srv/cs/control" || l.DBPath != "/srv/db/cipherstore.sqlite" {
 		t.Errorf("layout = %+v", l)
 	}
@@ -390,6 +396,7 @@ func TestLayoutForRejectsBadOptions(t *testing.T) {
 		{"unknown mode", globalOptions{mode: "public"}},
 		{"group without group mode", globalOptions{mode: "solo", group: "wheel"}},
 		{"group with all mode", globalOptions{mode: "all", group: "wheel"}},
+		{"fullaccess in solo mode", globalOptions{mode: "solo", fullAccess: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -38,6 +38,7 @@ func TestLoadConfig(t *testing.T) {
 	path := writeConfig(t, `
 mode = "group"
 group = "wheel"
+fullaccess = true
 socketpath = "/srv/cipherstore"
 dbpath = "~/vault"
 `)
@@ -45,7 +46,7 @@ dbpath = "~/vault"
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	want := fileConfig{Mode: "group", Group: "wheel", SocketPath: "/srv/cipherstore", DBPath: filepath.Join(home, "vault")}
+	want := fileConfig{Mode: "group", Group: "wheel", FullAccess: true, SocketPath: "/srv/cipherstore", DBPath: filepath.Join(home, "vault")}
 	if cfg != want {
 		t.Errorf("loadConfig = %+v, want %+v", cfg, want)
 	}
@@ -136,6 +137,35 @@ func TestConfigGroupAppliesInGroupMode(t *testing.T) {
 	}
 	if o.mode != "group" || o.group != "staff" {
 		t.Errorf("merged options = %+v", o)
+	}
+}
+
+func TestConfigFullAccess(t *testing.T) {
+	path := writeConfig(t, "mode = \"all\"\nfullaccess = true\n")
+	o, _, _ := parseGlobal([]string{"-config", path, "status"}, io.Discard)
+	o, err := withConfig(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !o.fullAccess {
+		t.Error("fullaccess from the config was not applied in all mode")
+	}
+
+	// -fullaccess=false on the command line overrides the config.
+	o, _, _ = parseGlobal([]string{"-config", path, "-fullaccess=false", "status"}, io.Discard)
+	if o, _ = withConfig(o); o.fullAccess {
+		t.Error("-fullaccess=false did not override the config")
+	}
+
+	// Like group, it is dropped rather than rejected when the command line
+	// switches to solo mode.
+	o, _, _ = parseGlobal([]string{"-config", path, "-mode", "solo", "status"}, io.Discard)
+	o, _ = withConfig(o)
+	if o.fullAccess {
+		t.Error("fullaccess from the config was applied in solo mode")
+	}
+	if _, err := layoutFor(o); err != nil {
+		t.Errorf("layoutFor: %v", err)
 	}
 }
 

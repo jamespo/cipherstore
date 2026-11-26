@@ -58,11 +58,16 @@ func (m Mode) String() string {
 	}
 }
 
-// Policy is a Mode plus, for Group, the group that is let in.
+// Policy is a Mode plus, for Group, the group that is let in, and what users
+// other than the daemon's owner may do once connected.
 type Policy struct {
 	Mode Mode
 	// GID is the group allowed in Group mode. Other modes ignore it.
 	GID int
+	// FullAccess lets users other than the owner list, export, import, add and
+	// delete secrets. Without it they may only get secrets and ask for the
+	// status. Solo mode ignores it, since only the owner can connect.
+	FullAccess bool
 }
 
 // DirPerm is the mode the socket directory is given.
@@ -95,10 +100,17 @@ func (p Policy) SocketPerm() os.FileMode {
 }
 
 func (p Policy) String() string {
+	s := p.Mode.String()
 	if p.Mode == Group {
-		return fmt.Sprintf("group (gid %d)", p.GID)
+		s = fmt.Sprintf("group (gid %d)", p.GID)
 	}
-	return p.Mode.String()
+	if p.Mode == Solo {
+		return s
+	}
+	if p.FullAccess {
+		return s + ", full access"
+	}
+	return s + ", get only"
 }
 
 // LookupGroup resolves a group name, or a numeric gid, to a gid.
